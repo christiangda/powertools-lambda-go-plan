@@ -6,7 +6,7 @@ turnaround. Phases are sequential; tasks inside a phase can be parallelised wher
 
 ```mermaid
 gantt
-  title Implementation phases (engineer-days, one engineer; 2, 3 and 4 may run in parallel)
+  title Implementation phases (engineer-days, one engineer, phases 2, 3 and 4 may run in parallel)
   dateFormat YYYY-MM-DD
   axisFormat %d
   section Foundation

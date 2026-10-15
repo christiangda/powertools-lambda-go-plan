@@ -73,7 +73,7 @@ and trace header, and a `CaptureEMF(w)` decoder. Not in v1 to keep the API surfa
 
 ```mermaid
 flowchart TB
-  push["push / pull request"] --> test["test<br/>Go 1.27.x + tip, amd64 + arm64<br/>-race -shuffle, coverage >= 90 %"]
+  push["push / pull request"] --> test["test<br/>Go 1.27.x + tip, amd64 + arm64<br/>-race -shuffle, coverage at least 90 %"]
   push --> modules["modules<br/>each of 6 modules with GOWORK=off"]
   push --> deps["deps<br/>internal requires no utility;<br/>logger/metrics never require X-Ray SDK"]
   push --> lint["lint<br/>gofmt, vet, staticcheck, golangci-lint,<br/>govulncheck, betteralign, go fix -diff, no encoding/json v1"]

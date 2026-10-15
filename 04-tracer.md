@@ -41,7 +41,7 @@ Lambda service segment (facade)      ← SDK: BeginFacadeSegment from ctx.Value(
 ```mermaid
 flowchart TB
   facade["Lambda service segment (facade)<br/>id = header Parent, created by Lambda,<br/>never sent by us"]
-  h["## main.handle<br/>type: subsegment, parent_id = facade id<br/>annotations: ColdStart, Service<br/>metadata: &lt;name&gt; response | error"]
+  h["## main.handle<br/>type: subsegment, parent_id = facade id<br/>annotations: ColdStart, Service<br/>metadata: name response or name error"]
   c["charge<br/>tracer.CaptureResult"]
   ddb["DynamoDB<br/>namespace: aws<br/>awsv2.AWSV2Instrumentor"]
   api["api.example.com<br/>namespace: remote<br/>xray.Client / tracer.HTTPClient"]
@@ -207,10 +207,10 @@ sequenceDiagram
       F-->>T: err
       T->>S: AddMetadataToNamespace(service, "charge error", err.Error())
       T-->>X: err
-      X->>S: Close(err) -> fault, cause
+      X->>S: Close(err) sets fault and cause
     else fn succeeds
       F-->>T: value
-      T->>S: AddMetadataToNamespace(service, "charge response", jsontext.Value) if <= MaxMetadataBytes
+      T->>S: AddMetadataToNamespace(service, "charge response", jsontext.Value) if within MaxMetadataBytes
       T-->>X: nil
       X->>S: Close(nil)
     end

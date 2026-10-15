@@ -178,10 +178,10 @@ faster).
 flowchart LR
   pr["pull request"] --> t["test job<br/>AllocsPerRun budget tests<br/>(exact for 0-alloc paths)"]
   pr --> b["bench job (arm64, -cpu 1)<br/>go test -bench -count 10"]
-  pr --> s["size job<br/>examples/hello gated < 1 MB<br/>examples/full recorded"]
+  pr --> s["size job<br/>examples/hello gated under 1 MB<br/>examples/full recorded"]
   pr --> l["lint job<br/>betteralign report mode<br/>forbidigo / depguard on hot packages"]
   b --> bs["benchstat vs frozen baseline<br/>alpha 0.05"]
-  bs --> reg{ns/op regression > 10 %<br/>and significant?}
+  bs --> reg{ns/op regression above 10 %<br/>and significant?}
   reg -- yes --> rerun["re-run once"]
   rerun --> reg2{still regressed?}
   reg2 -- yes --> fail([fail])

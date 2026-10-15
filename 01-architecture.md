@@ -284,7 +284,7 @@ Design notes:
 flowchart TB
   subgraph chain["context chain for one invocation"]
     direction TB
-    base["runtime ctx<br/>deadline, lambdacontext.LambdaContext,<br/>value &quot;x-amzn-trace-id&quot;"]
+    base["runtime ctx<br/>deadline, lambdacontext.LambdaContext,<br/>value 'x-amzn-trace-id'"]
     st["+ invocation.State<br/>(one WithValue)"]
     seg["+ current *xray.Segment<br/>(only when sampled)"]
     base --> st --> seg
@@ -295,7 +295,7 @@ flowchart TB
   handler --> sub["tracer.Start(ctx, name)<br/>+ child segment"]
   g1 --> log["logger.FromContext(ctx)<br/>same keys, same xray_trace_id"]
   g2 --> met["metrics.FromContext(ctx)<br/>same Batch (mutex)"]
-  sub --> http["xray.Client / awsv2<br/>X-Amzn-Trace-Id: Root=..;Parent=&lt;child id&gt;;Sampled=.."]
+  sub --> http["xray.Client / awsv2<br/>X-Amzn-Trace-Id: Root=..;Parent=child-id;Sampled=.."]
   http --> downstream["downstream service"]
   classDef state fill:#fff4d6,stroke:#b7791f,color:#000;
   class st,seg state;
@@ -409,7 +409,7 @@ sequenceDiagram
   W->>TR: annotate ColdStart and Service, add response or error metadata, Close(err)
   TR-->>TR: emit one UDP datagram
   W->>LG: flush buffer on error (opt-in), ResetKeys
-  W->>MT: Flush() -> one stdout write
+  W->>MT: Flush(), one stdout write
   W-->>RT: (out, err) or re-panic
 ```
 
@@ -556,7 +556,7 @@ sequenceDiagram
   L->>RT: Next: event + Lambda-Runtime-Deadline-Ms
   RT->>W: ctx = WithDeadline(base, deadline)
   W->>W: begin(): State, segment, batch
-  W->>T: arm AfterFunc(remaining - margin)  [DeadlineMargin > 0]
+  W->>T: arm AfterFunc(remaining - margin) when DeadlineMargin is set
   W->>H: fn(ctx, in)
   H->>G: go work(ctx) ... (errgroup / WaitGroup.Go)
   G-->>H: Wait() before returning
@@ -565,7 +565,7 @@ sequenceDiagram
   W->>W: end(): close segment (UDP), flush buffer, flush batch (stdout), State.Closed = true
   W-->>RT: (out, err)
   RT->>L: response, then Next
-  RT->>RT: cancel() -> ctx.Done() closes
+  RT->>RT: cancel(), ctx.Done() closes
   L->>L: freeze environment (goroutines still running are suspended, F2)
   Note over L,G: On the next invocation the environment thaws: a goroutine that was not waited for resumes with the OLD ctx (already cancelled) and the OLD State (Closed). It cannot touch the new invocation.
 ```
@@ -580,11 +580,11 @@ stateDiagram-v2
   PreTimeout --> Open: WARN logged, buffer flushed, metrics snapshot flushed; batch keeps accepting
   Open --> Closed: end() (handler returned, errored or panicked)
   PreTimeout --> Closed: end()
-  Closed --> Closed: late logger call -> written immediately with the old invocation's keys (never buffered)
-  Closed --> Closed: late Batch.Add -> ErrBatchFlushed, dropped, one WARN per invocation
-  Closed --> Closed: late tracer.Start / Capture -> (ctx, nil), fn runs untraced, one WARN
+  Closed --> Closed: late logger call is written immediately with the old invocation's keys (never buffered)
+  Closed --> Closed: late Batch.Add returns ErrBatchFlushed, value dropped, one WARN per invocation
+  Closed --> Closed: late tracer.Start or Capture returns (ctx, nil), fn runs untraced, one WARN
   Closed --> Closed: Header(ctx), TraceID(ctx), RemainingTime(ctx) still answer
-  Closed --> [*]: State unreferenced -> garbage collected (never pooled)
+  Closed --> [*]: State unreferenced, garbage collected (never pooled)
 ```
 
 The rules are chosen so that a late goroutine is **observable** (its log lines still carry
@@ -601,7 +601,7 @@ flowchart TD
   q2 -- yes --> queue["Hand it off: SQS, EventBridge, Step Functions, a second function.<br/>Do not rely on it running after return (F2, F3)."]
   q2 -- no --> wait
   wait --> seg{Does the goroutine open subsegments?}
-  seg -- yes --> close["Close them before the handler returns: with the X-Ray SDK an open child holds back the emission of the whole handler trace (SDK flush waits for openSegments == 0). The wrapper warns when State.OpenSegments > 0 at end()."]
+  seg -- yes --> close["Close them before the handler returns: with the X-Ray SDK an open child holds back the emission of the whole handler trace (SDK flush waits for openSegments == 0). The wrapper warns when State.OpenSegments is not zero at end()."]
   seg -- no --> ok([ok])
   close --> ok
   queue --> ok
