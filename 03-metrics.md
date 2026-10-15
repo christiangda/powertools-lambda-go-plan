@@ -38,8 +38,8 @@ flowchart TB
   cwm --> ns["Namespace: 1-255 printable ASCII"]
   cwm --> dims["Dimensions: [[service], [service, environment]]<br/>max 29 keys per set"]
   cwm --> defs["Metrics: [{Name, Unit, StorageResolution?}]<br/>max 100 definitions"]
-  root --> dv["dimension members<br/>service: &quot;payment&quot;, environment: &quot;prod&quot;"]
-  root --> md["metadata members<br/>booking_id: &quot;7051cd10&quot; (not a dimension)"]
+  root --> dv["dimension members<br/>service: 'payment', environment: 'prod'"]
+  root --> md["metadata members<br/>booking_id: '7051cd10' (not a dimension)"]
   root --> mv["metric values<br/>SuccessfulBooking: [1, 1], Latency: 42.5<br/>max 100 values per array"]
   dims -. keys must exist as .-> dv
   defs -. names must exist as .-> mv
@@ -216,10 +216,10 @@ Nothing is emitted on warm invocations (no `ColdStart: 0`).
 
 ```mermaid
 flowchart TD
-  nb["wrapper: m.NewBatch() -> State.Metrics"] --> add["Batch.Add(name, unit, value)"]
+  nb["wrapper: m.NewBatch() stored in State.Metrics"] --> add["Batch.Add(name, unit, value)"]
   add --> v{valid?<br/>name 1-255, unit in list,<br/>value finite}
   v -- no --> err([return error])
-  v -- yes --> store["append value; new name -> names, defs"]
+  v -- yes --> store["append value, new name added to names and defs"]
   store --> lim{100 distinct metrics<br/>or 100 values on one?}
   lim -- yes --> auto["serialize + Write<br/>clear metrics only (keep dims, metadata)"]
   lim -- no --> more["more Add / AddDimension / AddMetadata"]

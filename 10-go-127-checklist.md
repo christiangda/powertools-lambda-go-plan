@@ -35,7 +35,7 @@ it; "allowed" means code may use it when it helps; "n/a" means it cannot matter 
 | `uuid` package | 1.27 | n/a | X-Ray ids are 8 random bytes in hex, not UUIDs; EMF has no ids. |
 | `hash/maphash.Hasher`, `math/big.Int.Divide`, `crypto/mldsa`, `simd` | 1.27 | n/a | |
 | `net/http` body drain on close, HTTP/2 priorities, `MaxHeaderValueCount` | 1.27 | n/a | The library owns no HTTP server and only wraps the client transport through the X-Ray SDK. |
-| `time` channels always unbuffered (`asynctimerchan` removed) | 1.27 | n/a | No timers in the library (05 §1). |
+| `time` channels always unbuffered (`asynctimerchan` removed) | 1.27 | n/a | The only timer is the opt-in `DeadlineMargin` `time.AfterFunc` (01 §7 D6), which has no channel; the library never uses `time.Timer.C` or `time.After`. |
 | `io.ReadAll` smaller final slice, `fmt.Errorf("x")` fewer allocations | 1.26 | allowed | Cold paths only. |
 | `crypto/rand` random parameter ignored | 1.26 | n/a | The X-Ray SDK calls `rand.Read` directly. |
 
