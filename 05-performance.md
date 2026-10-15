@@ -16,10 +16,19 @@ the budgets, how they are measured and how CI enforces them.
    64 KiB return cap (larger buffers are dropped, not pooled, to avoid pinning memory).
 4. **Zero work when disabled.** Level gate, unsampled trace, disabled metrics: no
    allocation, no lookup beyond what decides the gate.
-5. **Synchronous.** No background goroutines, timers or channels in the library: nothing
-   to lose at freeze, nothing to drain, trivially testable (Google: prefer synchronous
-   functions). The single exception is the opt-in `DeadlineMargin` timer (01 §7 D6),
-   one `time.AfterFunc` per invocation, stopped in `end()`, tested under `synctest`.
+5. **Synchronous.** No background goroutines, timers or channels in the library's own
+   code: nothing to lose at freeze, nothing to drain, trivially testable (Google: prefer
+   synchronous functions). The single exception is the opt-in `DeadlineMargin` timer
+   (01 §7 D6), one `time.AfterFunc` per invocation, stopped in `end()`, tested under
+   `synctest`; its callback runs in a goroutine only if it fires, and 01 §7 D6 defines
+   the race with `end()`. Scope of the claim: it covers `internal`, `logger`, `metrics`,
+   `tracer` and the root wrapper. The X-Ray SDK, a dependency of `tracer`, has paths that
+   start goroutines (`xray.BeginSegment` and other root segments, `xray.CaptureAsync`,
+   the centralized sampling poller on the first `ShouldTrace`); the wrapper calls none of
+   them, and in Lambda facade mode `BeginSubsegment` and `Close` are synchronous
+   (04 §1). Consumers who call those SDK functions directly own those goroutines. The
+   `goroutineleak` test (06 §1) is the proof: zero goroutines owned by library packages
+   after 1000 invocations, with and without `DeadlineMargin`.
 6. **Cold start matters as much as steady state.** No `init()` work beyond env reads,
    no package-level tables built at init that are not constants, standard library only
    in `internal`, `logger` and `metrics`. The X-Ray SDK (whose package init reads env
