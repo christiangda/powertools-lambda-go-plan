@@ -219,7 +219,7 @@ type Handler struct {
 
 ```mermaid
 flowchart TD
-  call["log.Info(msg, attrs...)"] --> en{Enabled?<br/>level at or above threshold<br/>or DEBUG sampled this invocation}
+  call["log.Info(msg, attrs...)"] --> en{Enabled?<br/>level >= threshold<br/>or DEBUG sampled this invocation}
   en -- no --> drop([return, 0 allocs])
   en -- yes --> rec["slog builds Record"] --> buf["buf := bufpool.Get()"]
   buf --> head["level, message, timestamp, service"]
@@ -229,7 +229,7 @@ flowchart TD
   st -- no --> attrs
   lam --> attrs["record attrs via jsonenc<br/>(groups, ReplaceAttr, error objects)"]
   attrs --> close["close groups, '}\n'"]
-  close --> b{buffering applies?<br/>level at or below BufferAtLevel,<br/>not cold start}
+  close --> b{buffering applies?<br/>level <= BufferAtLevel,<br/>not cold start}
   b -- yes --> lb["append to State.LogBuffer"]
   b -- no --> w["syncwriter.Write(buf) (one syscall)"]
   lb --> put["bufpool.Put(buf)"]
@@ -333,7 +333,7 @@ Per-invocation buffer stored in `State.LogBuffer` (type `invocation.LogBuffer`: 
 stateDiagram-v2
   [*] --> Empty: begin()
   Empty --> Buffering: record at or below BufferAtLevel
-  Buffering --> Buffering: more records (drop oldest when over MaxBytes)
+  Buffering --> Buffering: more records (drop oldest when > MaxBytes)
   Buffering --> Flushed: ERROR or above logged (FlushOnErrorLog)
   Buffering --> Flushed: logger.FlushBuffer(ctx)
   Buffering --> Flushed: handler error or panic (FlushBufferOnUncaughtError)

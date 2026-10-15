@@ -20,7 +20,7 @@ Consequences, all accepted:
 | The SDK keeps global mutable configuration (`xray.Configure`, `xray.SetLogger`, which is "not goroutine safe, only set from `init()`"). | `tracer.New` never touches global SDK state by default. Daemon address, emitter and strategies are left to the SDK's environment handling (`AWS_XRAY_DAEMON_ADDRESS`, `AWS_XRAY_CONTEXT_MISSING`), which Lambda sets. Tests use `xray.ContextWithConfig` for a per-context emitter instead of globals. |
 | SDK package init panics if `AWS_XRAY_DAEMON_ADDRESS` is malformed, and writes `/tmp/.aws-xray/initialized` when `LAMBDA_TASK_ROOT` is set. | Documented in the tracer package docs. Both are SDK behaviours we do not change. |
 | `xray.SdkDisabled()` reads `AWS_XRAY_SDK_DISABLED` with `os.Getenv` on every call. | Our enable check happens first and is a cached boolean; the SDK's per-call read only happens on active paths. |
-| The SDK's `Segment` is a large struct with an embedded `sync.RWMutex`, maps for annotations and metadata, and a goroutine per *root* segment for context cancellation. Other SDK paths that start goroutines: `xray.CaptureAsync`, and the centralized sampling strategy's poller on the first `ShouldTrace`. | The wrapper calls none of them. In Lambda the facade is built by `BeginFacadeSegment`, which starts no goroutine and never calls `ShouldTrace`; `BeginSubsegment`, `Capture` and `Close` are synchronous, and the UDP emitter writes inline. So the "synchronous" principle (05 §1) holds for the whole tracer path in Lambda. Consumers who call `xray.BeginSegment` or `xray.CaptureAsync` themselves own those goroutines. Allocation budgets for the sampled path are measured, not designed (05 §3). |
+| The SDK's `Segment` is a large struct with an embedded `sync.RWMutex`, maps for annotations and metadata, and a goroutine per *root* segment for context cancellation. | In Lambda there is never a root segment (the facade is built by `BeginFacadeSegment`, which starts no goroutine), so the goroutine cost does not apply. Allocation budgets for the sampled path are measured, not designed (05 §3). |
 | No `TestDaemon` in the SDK's `xray` package. | Tests implement the SDK's `xray.Emitter` interface (two methods) with an in-memory recorder, attached through `xray.ContextWithConfig(ctx, xray.Config{Emitter: rec})`. |
 
 Not wrapped: nothing is hidden. Where the SDK already offers the right API
@@ -41,7 +41,7 @@ Lambda service segment (facade)      ← SDK: BeginFacadeSegment from ctx.Value(
 ```mermaid
 flowchart TB
   facade["Lambda service segment (facade)<br/>id = header Parent, created by Lambda,<br/>never sent by us"]
-  h["## main.handle<br/>type: subsegment, parent_id = facade id<br/>annotations: ColdStart, Service<br/>metadata: name response or name error"]
+  h["## main.handle<br/>type: subsegment, parent_id = facade id<br/>annotations: ColdStart, Service<br/>metadata: &lt;name&gt; response | error"]
   c["charge<br/>tracer.CaptureResult"]
   ddb["DynamoDB<br/>namespace: aws<br/>awsv2.AWSV2Instrumentor"]
   api["api.example.com<br/>namespace: remote<br/>xray.Client / tracer.HTTPClient"]
@@ -207,10 +207,10 @@ sequenceDiagram
       F-->>T: err
       T->>S: AddMetadataToNamespace(service, "charge error", err.Error())
       T-->>X: err
-      X->>S: Close(err) sets fault and cause
+      X->>S: Close(err) -> fault, cause
     else fn succeeds
       F-->>T: value
-      T->>S: AddMetadataToNamespace(service, "charge response", jsontext.Value) if within MaxMetadataBytes
+      T->>S: AddMetadataToNamespace(service, "charge response", jsontext.Value) if <= MaxMetadataBytes
       T-->>X: nil
       X->>S: Close(nil)
     end

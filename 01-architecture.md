@@ -284,7 +284,7 @@ Design notes:
 flowchart TB
   subgraph chain["context chain for one invocation"]
     direction TB
-    base["runtime ctx<br/>deadline, lambdacontext.LambdaContext,<br/>value 'x-amzn-trace-id'"]
+    base["runtime ctx<br/>deadline, lambdacontext.LambdaContext,<br/>value &quot;x-amzn-trace-id&quot;"]
     st["+ invocation.State<br/>(one WithValue)"]
     seg["+ current *xray.Segment<br/>(only when sampled)"]
     base --> st --> seg
@@ -295,7 +295,7 @@ flowchart TB
   handler --> sub["tracer.Start(ctx, name)<br/>+ child segment"]
   g1 --> log["logger.FromContext(ctx)<br/>same keys, same xray_trace_id"]
   g2 --> met["metrics.FromContext(ctx)<br/>same Batch (mutex)"]
-  sub --> http["xray.Client / awsv2<br/>X-Amzn-Trace-Id: Root=..;Parent=child-id;Sampled=.."]
+  sub --> http["xray.Client / awsv2<br/>X-Amzn-Trace-Id: Root=..;Parent=&lt;child id&gt;;Sampled=.."]
   http --> downstream["downstream service"]
   classDef state fill:#fff4d6,stroke:#b7791f,color:#000;
   class st,seg state;
@@ -409,7 +409,7 @@ sequenceDiagram
   W->>TR: annotate ColdStart and Service, add response or error metadata, Close(err)
   TR-->>TR: emit one UDP datagram
   W->>LG: flush buffer on error (opt-in), ResetKeys
-  W->>MT: Flush(), one stdout write
+  W->>MT: Flush() -> one stdout write
   W-->>RT: (out, err) or re-panic
 ```
 
@@ -539,7 +539,7 @@ what consumers must do with their own goroutines.
 | D3 | **The library creates no goroutine on its own**, with one opt-in exception, D6. Nothing of ours can be left running when the environment freezes. |
 | D4 | **A finished invocation is closed, not recycled.** `end()` sets `State.Closed`. Objects reachable from a late goroutine (`State`, the metrics `Batch`, the `LogBuffer`) are **never pooled**, so a goroutine that outlives the handler (F3) can only ever touch its own invocation's data, never the next one's. Late calls degrade in a defined way (7.4). |
 | D5 | **Helpers for deadline-aware code.** `powertools.RemainingTime(ctx) time.Duration` (the Go form of `getRemainingTimeInMillis`) and `powertools.Deadline(ctx) (time.Time, bool)`. Both read `ctx.Deadline()`; they exist so handler code does not need to know how the runtime encodes it. |
-| D6 | **Opt-in pre-timeout flush** (`Options.DeadlineMargin`, default 0 = off). With a margin of, say, 100 ms, `begin()` arms `time.AfterFunc(remaining - margin, preTimeout)`. If the handler is still running when it fires, `preTimeout` writes a `WARN` line (`"invocation within <margin> of its deadline"` with `remaining_ms`), flushes the log buffer and flushes a **snapshot** of the metrics batch (the batch keeps accepting; `end()` flushes the remainder). The trace is not touched: closing the handler segment early would misreport the invocation. `end()` stops the timer. This is the only timer and the only goroutine the library can create; its lifetime ends at `end()`. Race with `end()`, defined: `preTimeout` first checks `State.Closed` and returns if set; `end()` calls `Stop()` and does not wait for a callback that already started, which is safe because every path the callback uses is mutex-protected and idempotent (`FlushSnapshot` on a flushed batch and a buffer flush on an empty buffer are no-ops, and the `WARN` is written through the same `syncwriter`). The worst case is one extra `WARN` line and one extra EMF blob containing only metrics added between the snapshot and `Flush`, never a lost or duplicated metric value. Reason: after a timeout the runtime is reset (F4), so diagnostics that were not written before the deadline never reach CloudWatch. |
+| D6 | **Opt-in pre-timeout flush** (`Options.DeadlineMargin`, default 0 = off). With a margin of, say, 100 ms, `begin()` arms `time.AfterFunc(remaining - margin, preTimeout)`. If the handler is still running when it fires, `preTimeout` writes a `WARN` line (`"invocation within <margin> of its deadline"` with `remaining_ms`), flushes the log buffer and flushes a **snapshot** of the metrics batch (the batch keeps accepting; `end()` flushes the remainder). The trace is not touched: closing the handler segment early would misreport the invocation. `end()` stops the timer. This is the only timer and the only goroutine the library can create; its lifetime ends at `end()`. Reason: after a timeout the runtime is reset (F4), so diagnostics that were not written before the deadline never reach CloudWatch. |
 | D7 | **Goroutine leaks become visible.** `State.OpenSegments` counts child segments opened through `tracer.Start`/`Capture` and not yet closed. If it is non-zero in `end()`, a `WARN` names the count, because with the X-Ray SDK an open child delays emission of the whole handler trace (7.5). The `goroutineleak` profile test (06 §1) proves the library itself leaks nothing. |
 
 ### 7.3 Timeline of an invocation
@@ -556,7 +556,7 @@ sequenceDiagram
   L->>RT: Next: event + Lambda-Runtime-Deadline-Ms
   RT->>W: ctx = WithDeadline(base, deadline)
   W->>W: begin(): State, segment, batch
-  W->>T: arm AfterFunc(remaining - margin) when DeadlineMargin is set
+  W->>T: arm AfterFunc(remaining - margin)  [DeadlineMargin > 0]
   W->>H: fn(ctx, in)
   H->>G: go work(ctx) ... (errgroup / WaitGroup.Go)
   G-->>H: Wait() before returning
@@ -565,7 +565,7 @@ sequenceDiagram
   W->>W: end(): close segment (UDP), flush buffer, flush batch (stdout), State.Closed = true
   W-->>RT: (out, err)
   RT->>L: response, then Next
-  RT->>RT: cancel(), ctx.Done() closes
+  RT->>RT: cancel() -> ctx.Done() closes
   L->>L: freeze environment (goroutines still running are suspended, F2)
   Note over L,G: On the next invocation the environment thaws: a goroutine that was not waited for resumes with the OLD ctx (already cancelled) and the OLD State (Closed). It cannot touch the new invocation.
 ```
@@ -580,11 +580,11 @@ stateDiagram-v2
   PreTimeout --> Open: WARN logged, buffer flushed, metrics snapshot flushed; batch keeps accepting
   Open --> Closed: end() (handler returned, errored or panicked)
   PreTimeout --> Closed: end()
-  Closed --> Closed: late logger call is written immediately with the old invocation's keys (never buffered)
-  Closed --> Closed: late Batch.Add returns ErrBatchFlushed, value dropped, one WARN per invocation
-  Closed --> Closed: late tracer.Start or Capture returns (ctx, nil), fn runs untraced, one WARN
+  Closed --> Closed: late logger call -> written immediately with the old invocation's keys (never buffered)
+  Closed --> Closed: late Batch.Add -> ErrBatchFlushed, dropped, one WARN per invocation
+  Closed --> Closed: late tracer.Start / Capture -> (ctx, nil), fn runs untraced, one WARN
   Closed --> Closed: Header(ctx), TraceID(ctx), RemainingTime(ctx) still answer
-  Closed --> [*]: State unreferenced, garbage collected (never pooled)
+  Closed --> [*]: State unreferenced -> garbage collected (never pooled)
 ```
 
 The rules are chosen so that a late goroutine is **observable** (its log lines still carry
@@ -601,7 +601,7 @@ flowchart TD
   q2 -- yes --> queue["Hand it off: SQS, EventBridge, Step Functions, a second function.<br/>Do not rely on it running after return (F2, F3)."]
   q2 -- no --> wait
   wait --> seg{Does the goroutine open subsegments?}
-  seg -- yes --> close["Close them before the handler returns: with the X-Ray SDK an open child holds back the emission of the whole handler trace (SDK flush waits for openSegments == 0). The wrapper warns when State.OpenSegments is not zero at end()."]
+  seg -- yes --> close["Close them before the handler returns: with the X-Ray SDK an open child holds back the emission of the whole handler trace (SDK flush waits for openSegments == 0). The wrapper warns when State.OpenSegments > 0 at end()."]
   seg -- no --> ok([ok])
   close --> ok
   queue --> ok

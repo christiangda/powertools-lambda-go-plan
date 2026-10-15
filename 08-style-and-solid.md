@@ -15,7 +15,7 @@
 | Errors: return, do not panic; sentinel values with `errors.Is`; lowercase messages; `%w` only when part of the contract | 01 §6 |
 | Panics only for truly unreachable code; `Must*` only at init | no `Must*` in v1; the only `panic` is the re-panic in the wrapper |
 | Global state with extreme scrutiny; provide instances, no hidden globals | no default instances; only the cold-start atomic, env snapshot and pools are package-level (01 §5) |
-| Goroutine lifetimes obvious; prefer synchronous | no goroutines, timers or channels in the library's own code, except the opt-in `DeadlineMargin` `time.AfterFunc`, whose lifetime ends in `end()` (05 §1, 01 §7 D6) |
+| Goroutine lifetimes obvious; prefer synchronous | no goroutines in the library |
 | Document concurrency safety, cleanup, sentinel errors | every exported type's doc states "safe for concurrent use" or the locking rule; `Close`/`Flush` ownership documented |
 | Receiver names short and consistent | `h *Handler`, `m *Metrics`, `b *Batch`, `t *Tracer`, `s *Segment` |
 | Zero-value usability | `Options{}` works; nil `*Batch` and `*Segment` are no-ops (documented) |
