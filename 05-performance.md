@@ -22,7 +22,7 @@ the budgets, how they are measured and how CI enforces them.
    (01 §7 D6), one `time.AfterFunc` per invocation, stopped in `end()`, tested under
    `synctest`; its callback runs in a goroutine only if it fires, and 01 §7 D6 defines
    the race with `end()`. Scope of the claim: it covers `internal`, `logger`, `metrics`,
-   `tracer` and the root wrapper. The X-Ray SDK, a dependency of `tracer`, has paths that
+   `tracer` and the root wrapper. The X-Ray SDK, imported only by `tracer`, has paths that
    start goroutines (`xray.BeginSegment` and other root segments, `xray.CaptureAsync`,
    the centralized sampling poller on the first `ShouldTrace`); the wrapper calls none of
    them, and in Lambda facade mode `BeginSubsegment` and `Close` are synchronous
@@ -32,7 +32,8 @@ the budgets, how they are measured and how CI enforces them.
 6. **Cold start matters as much as steady state.** No `init()` work beyond env reads,
    no package-level tables built at init that are not constants, standard library only
    in `internal`, `logger` and `metrics`. The X-Ray SDK (whose package init reads env
-   and dials nothing) is linked only through the `tracer` module.
+   and dials nothing) is imported only by the `tracer` package, so it is linked only
+   into binaries that use tracing.
 7. **Small when unavoidable.** Go 1.27's size-specialised allocators make objects under
    80 bytes up to 30 % cheaper to allocate. Per-record allocations that cannot be
    pooled away (an `*XRayLogger` message wrapper, a sanitised segment name) are kept
@@ -140,15 +141,15 @@ faster).
 - Keyed struct literals everywhere (a Google style rule for literals of types from other
   packages, extended here to all struct literals) mean the tool's positional-literal
   guard never blocks a rewrite, and a reorder can never silently mis-assign a field.
-- Workflow: `make align` runs `betteralign -apply ./...` in every module, followed by
+- Workflow: `make align` runs `betteralign -apply ./...` on the module and on `examples`, followed by
   `go build ./...` and `go test ./...` (the tool's documented safety check, because
   positional literals of exported structs in other packages are not detected). CI runs
   the report-only mode and fails on any finding (§6). The tool is single-pass, so
   `make align` runs it twice.
-- Pinned invocation, no `go.mod` pollution of any module:
+- Pinned invocation, no `go.mod` pollution of the module:
   `go run github.com/dkorunic/betteralign/cmd/betteralign@<pinned version> ./...`.
   The version lives in one Makefile variable. Alternative if more tools accumulate: a
-  `tools` module with Go 1.24+ `tool` directives, kept out of the published modules so
+  `tools` module with Go 1.24+ `tool` directives, kept out of the published module so
   consumers' dependency graphs stay clean.
 - Known caveats, all handled: files are LF (`.gitattributes`), there are no cgo, ABI or
   wire-format structs in the library (JSON output is assembled by hand, never by
@@ -215,7 +216,7 @@ flowchart LR
    function; `examples/full` (with `tracer`, which links the X-Ray SDK and its
    dependencies) is recorded and reported on every run but not gated, because the
    delta is the SDK's.
-4. `betteralign ./...` in report mode on every module; any
+4. `betteralign ./...` in report mode on the module and on `examples`; any
    finding fails the `lint` job with the tool's own diagnostic
    (`8 bytes saved: struct of size 24 could be 16`). Test files are included
    (`-test_files`) so test fixtures do not drift either.

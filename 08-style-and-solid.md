@@ -5,7 +5,7 @@
 | Rule (guide / decisions / best practices) | How this codebase applies it |
 | --- | --- |
 | `gofmt`, MixedCaps, no underscores | enforced in CI; JSON keys with underscores are string literals, never identifiers |
-| Package names short, lowercase, no `util`/`common`/`helper` | `logger`, `metrics`, `tracer`, `powertools`; the shared module is named `internal` so the compiler enforces its visibility, and its packages are `invocation`, `lambdaenv`, `jsonenc`, `bufpool`, `syncwriter` |
+| Package names short, lowercase, no `util`/`common`/`helper` | `logger`, `metrics`, `tracer`, `powertools`; shared code lives under `internal/` (`invocation`, `lambdaenv`, `jsonenc`, `bufpool`, `syncwriter`), invisible to consumers by the ordinary Go rule |
 | Avoid repetition: `widget.New`, not `widget.NewWidget` | `logger.New`, `metrics.New`, `tracer.New`; `metrics.Count`, not `metrics.UnitCount` |
 | No `Get` prefix on getters | `CorrelationID(ctx)`, `TraceID(ctx)`, `Header(ctx)`, `Keys(ctx)`, `Handler.Level()` |
 | Type suffix for variants | `Add` / `AddHighResolution`; `AddMetadata` / `AddMetadataToNamespace` |
@@ -36,7 +36,7 @@
 | **Open/closed** | behaviour extends through option-struct fields, `ReplaceAttr`, `slog` composition (`NewMultiHandler`, `With`), new modules for new integrations; no existing call site changes when a field is added |
 | **Liskov substitution** | `*logger.Handler` is a drop-in `slog.Handler` proven by `slogtest`; `*tracer.XRayLogger` is a drop-in `xraylog.Logger`; `WrapHandler` returns a `lambda.Handler` usable anywhere one is accepted; the tracer returns the SDK's own `*xray.Segment`, so every SDK function accepts it |
 | **Interface segregation** | the library consumes the narrowest standard interfaces (`io.Writer`, not `*os.File`; `slog.Leveler`, not `*slog.LevelVar`) and exports none, so consumers can declare the one-method interface they actually use (`type metricRecorder interface{ Add(string, metrics.Unit, float64) error }`) and satisfy it with `*metrics.Batch` |
-| **Dependency inversion** | hot paths depend on abstractions owned by the standard library; the X-Ray SDK appears only in the `tracer` module, and `internal` never imports a utility (enforced by the `deps` CI job); the wrapper depends on the utilities only through their exported lifecycle methods (`NewBatch`, `Flush`, `Start`, `Close`, `FlushBuffer`), the same ones consumers use without the wrapper |
+| **Dependency inversion** | hot paths depend on abstractions owned by the standard library; the X-Ray SDK is imported only by the `tracer` package, and `internal/...` never imports a utility (both enforced by the `deps` CI job); the wrapper depends on the utilities only through their exported lifecycle methods (`NewBatch`, `Flush`, `Start`, `Close`, `FlushBuffer`), the same ones consumers use without the wrapper |
 
 ## 3. API review checklist (before `v1.0.0`)
 

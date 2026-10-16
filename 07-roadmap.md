@@ -27,7 +27,7 @@ Phases 3 and 4 finish before Phase 2 when run in parallel, so Phase 5 waits on P
 ## Phase 0: Scaffolding (2 days)
 
 - [ ] Copy the decision log (09) to `docs/DECISIONS.md`; all 23 decisions are taken.
-- [ ] Six `go.mod` files with `go 1.27.0` (root, `internal`, `logger`, `metrics`, `tracer`, `examples`) and a `go.work`; the `deps` CI job enforcing that `internal` requires no utility and that `logger`/`metrics` never require the X-Ray SDK.
+- [ ] One `go.mod` (`go 1.27.0`) for the library and an untagged `examples/go.mod` with a `replace` to the parent; the `deps` CI job enforcing the import rules (`internal/...` imports no utility; only `tracer` imports the X-Ray SDK).
 - [ ] Repository layout from 01 §2; `LICENSE`, `README.md` skeleton, `CONTRIBUTING.md`,
       `CHANGELOG.md`, `.github/workflows/{test,lint,bench,size}.yml`, `Makefile`
       (`test`, `lint`, `bench`, `profile`, `build-examples`).
@@ -151,7 +151,7 @@ flowchart LR
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
 | X-Ray SDK global state: `xray.Configure` and `xray.SetLogger` are process-wide and the latter is not goroutine-safe; SDK package init panics on a malformed `AWS_XRAY_DAEMON_ADDRESS` | surprising failures in tests or at cold start | the wrapper never calls the global setters; per-context config in tests; documented in package docs; the UDP end-to-end test runs in its own binary |
-| Version skew between `internal` and a utility module when consumers mix versions | compile errors or silent contract drift in `State` | lockstep tagging (decision 21); `State` fields only ever added, never renamed, within a major version |
+| Single module: the X-Ray SDK and its tree are in every consumer's module graph, even logger-only users | Dependabot and `go.sum` noise for users who never link the SDK | `deps` job guarantees only `tracer` imports it, so binaries are unaffected; `govulncheck` reports reachable vulnerabilities only; documented in the README; splitting `tracer` into its own module remains possible at a major version (decision 25) |
 | Multi-concurrency semantics change in `aws-lambda-go` | trace header source breaks | the header source is isolated in `internal/lambdaenv`; integration test under Managed Instances when available in the sandbox |
 | `encoding/json/v2` API churn after 1.27 | compile breaks on tip | the package is GA in Go 1.27 and covered by the standard library compatibility promise; all use goes through `internal/jsonenc`, so an adjustment is one package wide (decision 23) |
 | Budgets too aggressive for CI noise | flaky `bench` job | gate on `benchstat` significance, `-cpu 1`, re-run once, keep alloc budgets exact only for the 0-alloc paths |

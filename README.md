@@ -29,7 +29,7 @@ with `github.com/aws/aws-lambda-go` on the `provided.al2023` runtime.
 | [06-testing-and-ci.md](06-testing-and-ci.md) | Test layers, conformance suites, lint, CI pipeline, release process. |
 | [07-roadmap.md](07-roadmap.md) | Phases, task checklists, acceptance criteria, estimates, risks. |
 | [08-style-and-solid.md](08-style-and-solid.md) | How the Google Go style guide and SOLID are applied, with concrete rules and an API review checklist. |
-| [09-open-questions.md](09-open-questions.md) | Decision log: all 23 reviewer decisions with where each is applied. |
+| [09-open-questions.md](09-open-questions.md) | Decision log: all reviewer decisions (25, three of them superseded) with where each is applied. |
 | [11-maintainability.md](11-maintainability.md) | Maintainability review: what keeps the library maintainable, the costs deliberately accepted and how each is bounded, and the three adjustments that came out of the review. |
 | [10-go-127-checklist.md](10-go-127-checklist.md) | Every Go 1.26 and 1.27 change checked against the plan: adopted, allowed, or not applicable, with the section that uses it. |
 
@@ -73,51 +73,47 @@ with `github.com/aws/aws-lambda-go` on the `provided.al2023` runtime.
 - **Degrade, never fail.** Observability must not break the business handler: emitter
   errors are logged at debug level and swallowed; disabled or unsampled paths are no-ops
   that allocate nothing.
-- **Least mechanism, per module.** `logger`, `metrics` and the shared `internal`
-  module depend on the standard library and `aws-lambda-go` only. The X-Ray SDK is
-  linked only by consumers of the `tracer` module.
+- **Least mechanism, one module, one version.** The repository publishes a single Go
+  module with a single version tag (decision 25). `internal`, `logger` and `metrics`
+  import only the standard library and `aws-lambda-go`; the X-Ray SDK is imported only
+  by `tracer`, so Go links it only into binaries that use tracing.
 
 ## Module and package layout
 
-Six Go modules in one repository (decision 4). Each `go.mod` is marked.
+One Go module, one `go.mod`, one version for every package (decision 25).
 
 ```
-github.com/aizon-shared/powertools-lambda-go
-├── go.mod                   module: root; package powertools (Wrap, WrapHandler, Options, ctx accessors)
-├── go.work                  development workspace listing every module below
-├── powertools.go, invocation.go
-├── internal/                module: shared internals, importable only from this path prefix (compiler-enforced)
-│   ├── go.mod
+github.com/aizon-shared/powertools-lambda-go      module, tagged vX.Y.Z as a whole
+├── go.mod                   go 1.27.0; requires aws-lambda-go and aws-xray-sdk-go/v2
+├── powertools.go, invocation.go   package powertools: Wrap, WrapHandler, Options, ctx accessors
+├── internal/                shared internals; not importable by consumers (Go internal rule)
 │   ├── invocation/          per-invocation State, context key, LogBuffer
 │   ├── lambdaenv/           in-Lambda detection, trace-header parsing, function metadata, env parsing
 │   ├── jsonenc/             append-style JSON helpers shared by logger and metrics (json/v2, jsontext)
 │   ├── bufpool/             pooled []byte
 │   └── syncwriter/          mutex writer, one Write per record
-├── logger/                  module: slog.Handler, six ALC levels, Trace…Fatal(ctx, …), invocation keys, buffer
-│   └── go.mod
-├── metrics/                 module: EMF Metrics, Batch, Single, Unit, Resolution
-│   └── go.mod
-├── tracer/                  module: Powertools semantics over aws-xray-sdk-go/v2
-│   └── go.mod
-├── examples/                module: deployable samples (SAM), used by smoke tests and size measurements
-│   └── go.mod
+├── logger/                  package logger: slog.Handler, six ALC levels, Trace…Fatal(ctx, …), invocation keys, buffer
+├── metrics/                 package metrics: EMF Metrics, Batch, Single, Unit, Resolution
+├── tracer/                  package tracer: Powertools semantics over aws-xray-sdk-go/v2
+├── examples/                deployable samples (SAM); its own UNTAGGED go.mod with a replace to the parent,
+│   └── go.mod               so SAM and AWS service clients never enter the library's go.mod
 └── .plan/                   this directory
 ```
 
-### Module dependency graph
+### Package dependency graph
 
 ```mermaid
 flowchart LR
-  subgraph repo["github.com/aizon-shared/powertools-lambda-go"]
-    root["root module<br/>package powertools<br/>(Wrap, WrapHandler)"]
+  subgraph mod["module github.com/aizon-shared/powertools-lambda-go, one version tag"]
+    root["powertools<br/>(Wrap, WrapHandler)"]
     logger["logger"]
     metrics["metrics"]
     tracer["tracer"]
-    internal["internal<br/>(invocation, lambdaenv,<br/>jsonenc, bufpool, syncwriter)"]
-    examples["examples"]
+    internal["internal/...<br/>(invocation, lambdaenv,<br/>jsonenc, bufpool, syncwriter)"]
   end
   lambdago["aws-lambda-go"]
   xray["aws-xray-sdk-go/v2<br/>(+ grpc, protobuf, fasthttp, aws-sdk-go-v2)"]
+  examples["examples<br/>(untagged module, replace to parent)"]
   root --> logger
   root --> metrics
   root --> tracer
@@ -135,9 +131,10 @@ flowchart LR
   class lambdago std;
 ```
 
-Arrows mean "requires". `internal` is importable only from paths under the repository
-prefix, which the compiler enforces. A logger-only consumer links `logger`, `internal`
-and `aws-lambda-go`; the X-Ray SDK is reachable only through `tracer`.
+Arrows mean "imports". Go links only the packages a binary imports: a logger-only
+consumer links `logger`, `internal` and `aws-lambda-go`; the X-Ray SDK is linked only
+when `tracer` is imported. It does appear in every consumer's module graph (`go.sum`),
+which is the accepted cost of a single version (01 §2).
 
 ### Where the data goes
 
@@ -203,7 +200,7 @@ func handle(ctx context.Context, in Order) (Receipt, error) {
 | M2 | Logger | slog handler passes `testing/slogtest`, parity output, buffering, sampling |
 | M3 | Metrics | EMF output validated against the AWS schema, limits, cold-start metric |
 | M4 | Tracer | Wrapper over the X-Ray SDK: handler segment, capture helpers, recording-emitter tests, traces visible in X-Ray |
-| M5 | Examples and integration | Examples with SDK v2 and HTTP instrumentation, deployed smoke test, size and init measurements per module |
+| M5 | Examples and integration | Examples with SDK v2 and HTTP instrumentation, deployed smoke test, size and init measurements for a logger-only and a full binary |
 | M6 | Performance and release | Baselines, budgets as tests, benchstat gate, docs, `v0.1.0` |
 
 Estimates and task breakdown are in [07-roadmap.md](07-roadmap.md).

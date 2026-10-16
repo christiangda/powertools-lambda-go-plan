@@ -59,11 +59,11 @@ it; "allowed" means code may use it when it helps; "n/a" means it cannot matter 
 | `go test` runs the `stdversion` vet check | 1.27 | adopted | Guarantees no symbol newer than the `go 1.27.0` directive is used (06 §4). |
 | `go fix` modernizers (`atomictypes`, `embedlit`, `slicesbackward`, `unsafefuncs`, `waitgroupgo`, `//go:fix inline`) | 1.26, 1.27 | adopted | `go fix -diff ./...` is a `lint` gate; the cold-start flag is an `atomic.Bool` from the start (06 §4). |
 | `gofmt` alignment changes | 1.27 | adopted | CI pins the toolchain so `gofmt -l` is stable (06 §4). |
-| `go mod tidy` merges `require` blocks (two blocks) | 1.27 | adopted | Release target runs `tidy` in each module (06 §6). |
+| `go mod tidy` merges `require` blocks (two blocks) | 1.27 | adopted | Release target runs `tidy` on the module and on `examples` (06 §6). |
 | `go doc pkg@version`, `go doc -ex` | 1.27 | adopted | `go doc -ex` lists runnable examples per package in the docs job (06 §7). |
 | `go test -json` `OutputType` field | 1.27 | allowed | CI log parsing may use it. |
 | `go tool trace -http` localhost only, `bzr` removed, response files | 1.27 | n/a | |
-| `go mod init` lower default `go` version | 1.26 | noted | The directive is set explicitly to `go 1.27.0` in every module. |
+| `go mod init` lower default `go` version | 1.26 | noted | The directive is set explicitly to `go 1.27.0` in the module and in `examples`. |
 
 ## Deprecations and removals that could bite
 

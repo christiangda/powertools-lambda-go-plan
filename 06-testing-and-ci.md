@@ -74,13 +74,12 @@ and trace header, and a `CaptureEMF(w)` decoder. Not in v1 to keep the API surfa
 ```mermaid
 flowchart TB
   push["push / pull request"] --> test["test<br/>Go 1.27.x + tip, amd64 + arm64<br/>-race -shuffle, coverage at least 90 %"]
-  push --> modules["modules<br/>each of 6 modules with GOWORK=off"]
-  push --> deps["deps<br/>internal requires no utility;<br/>logger/metrics never require X-Ray SDK"]
+  push --> deps["deps (go list -deps)<br/>internal imports no utility;<br/>only tracer imports the X-Ray SDK"]
   push --> lint["lint<br/>gofmt, vet, staticcheck, golangci-lint,<br/>govulncheck, betteralign, go fix -diff, no encoding/json v1"]
   push --> bench["bench<br/>benchstat gate"]
   push --> size["size<br/>hello gated, full recorded"]
   nightly["nightly / manual"] --> integ["integration<br/>sam deploy, invoke,<br/>assert logs / EMF / traces, sam delete"]
-  test & modules & deps & lint & bench & size --> merge{all green?}
+  test & deps & lint & bench & size --> merge{all green?}
   merge -- yes --> tag["eligible to tag"]
   merge -- no --> stop([blocked])
 ```
@@ -88,65 +87,50 @@ flowchart TB
 | Job | Matrix | Steps |
 | --- | --- | --- |
 | `test` | Go 1.27.x and tip; `ubuntu-latest` (amd64) and `ubuntu-24.04-arm` | `go build ./...`, `go test -race -shuffle=on -coverprofile ./...`, coverage ≥ 90 % for `logger`, `metrics`, `tracer`, root |
-| `modules` | same | for each of the six modules: `go build ./...` and `go test -race ./...` run from the module directory with `GOWORK=off`, so every module proves it builds against its own `go.mod`, not only through `go.work` |
-| `deps` | Go 1.27.x | `go mod graph` per module; fails if `internal` requires any utility module, or if `logger` or `metrics` require `aws-xray-sdk-go` |
+| `deps` | Go 1.27.x | `go list -deps` per package; fails if any `internal/...` package imports `logger`, `metrics` or `tracer`, or if any package other than `tracer` imports `github.com/aws/aws-xray-sdk-go/...` (the single-module cost in 01 §2 stays bounded to tracing binaries) |
 | `lint` | Go 1.27.x | gofmt, vet, staticcheck, golangci-lint, govulncheck, betteralign (report mode), tidy check |
 | `bench` | Go 1.27.x, arm64 runner | `make bench`, `benchstat` against the frozen baseline, 10 % regression gate (05 §6) |
-| `size` | Go 1.27.x | build `examples/hello` (gated) and `examples/full` (recorded) for `linux/arm64` |
+| `size` | Go 1.27.x | build `examples/hello` (logger and metrics only, gated) and `examples/full` (with tracer, recorded) for `linux/arm64` from the `examples` module, which also proves the `replace`-based examples build |
 | `integration` (nightly, manual dispatch) | | `sam build && sam deploy` to a sandbox account, invoke, assert logs/EMF/traces with the AWS CLI, `sam delete` |
 
-`GOFLAGS=-mod=mod` is never used; the module cache is restored from `go.sum`.
+`GOFLAGS=-mod=mod` is never used; the module cache is restored from `go.sum`. Every job
+runs `go build ./... && go test ./...` from the repository root (the library module) and
+then from `examples/`.
 
 ## 6. Release process
 
+- **One module, one version (decision 25).** A single git tag `vX.Y.Z` versions every
+  package. `go get github.com/aizon-shared/powertools-lambda-go@vX.Y.Z` brings `logger`,
+  `metrics`, `tracer` and the wrapper at that version. There are no per-package tags, no
+  `go.work`, and no `require` lines between components to rewrite.
 - Semantic versioning. `v0.x` until the API review checklist (08 §3) passes; then
-  `v1.0.0` with a compatibility promise for the exported API of every module except
-  `internal`, which has no external consumers by construction.
-- **How Go versions a multi-module repository (standard, not a choice).** Each module
-  is versioned by its own git tag prefixed with the module directory: `logger/v0.1.0`,
-  `internal/v0.1.0`, `tracer/v0.1.0`; the root module uses a plain `v0.1.0`.
-  `go get github.com/aizon-shared/powertools-lambda-go/logger@v0.1.0` resolves the
-  `logger/v0.1.0` tag. This is documented in the Go modules reference ("Multiple-module
-  repositories" in *Managing module source*). `go.work` is a development convenience and
-  never decides versions; `go.mod` files never contain `replace` directives.
-- **Why lockstep tagging (decision 21).** Lockstep means every
-  release tags all six modules with the *same* version number, whether or not a module
-  changed. It is a release-process convention layered on the standard mechanism above,
-  used by OpenTelemetry-Go and matching how Powertools Python/TypeScript ship one
-  version for the toolkit. Reasons:
-  1. The root wrapper writes fields of `internal/invocation.State` that `logger`,
-     `metrics` and `tracer` read. The four modules must agree on one `internal`
-     contract. Go's minimum version selection resolves `internal` to the highest version
-     any of them requires, which is safe only while `internal` stays backward compatible
-     within the major version; lockstep makes "which `internal` goes with which
-     `logger`" a question nobody has to answer.
-  2. Consumers and the changelog see one version for the toolkit.
-  3. The release target is trivial: rewrite the inter-module `require` lines to the new
-     version, run `go mod tidy` in each module (which on Go 1.27 normalises each file to
-     two `require` blocks), commit, create the six tags. A tag on an unchanged module is
-     harmless.
-- **The alternative: independent versioning per module** (used by `aws-sdk-go-v2` and
-  `google-cloud-go`). A module is tagged only when it changes, and tooling bumps the
-  `require` lines of dependants whenever `internal` changes. It saves consumers nothing,
-  needs release tooling, and pays off only when modules have separate owners or release
-  cadences. Switching to it later breaks nobody, because tags are per module either way.
-- `make release VERSION=` implements lockstep; revisited at `v1.0.0` only if modules get separate owners.
-```mermaid
-flowchart LR
-  start(["make release VERSION=v0.2.0"]) --> req["rewrite inter-module require lines<br/>to v0.2.0 in all six go.mod files"]
-  req --> tidy["go mod tidy in each module<br/>(two require blocks on Go 1.27)"]
-  tidy --> ci{test, lint, bench, size green?}
-  ci -- no --> stop([abort])
-  ci -- yes --> commit["commit 'chore(release): v0.2.0'"]
-  commit --> tags["tags: v0.2.0, internal/v0.2.0, logger/v0.2.0,<br/>metrics/v0.2.0, tracer/v0.2.0, examples/v0.2.0"]
-  tags --> push["push commit + tags"]
-  push --> notes["GitHub release notes from CHANGELOG.md"]
-```
-
+  `v1.0.0` with a compatibility promise for the exported API of the module.
+  `internal/...` is excluded by construction (consumers cannot import it).
+- Why one version rather than per-package versions: the wrapper and the three utilities
+  share the `internal/invocation.State` contract, so there is nothing to version
+  separately without inventing a compatibility matrix; consumers and the changelog see
+  one version for the toolkit, as with Powertools Python. The accepted cost (the X-Ray
+  SDK in every consumer's module graph, never in logger-only binaries) is stated in
+  01 §2 and bounded by the `deps` job.
+- `examples/` is an untagged module with `replace github.com/aizon-shared/powertools-lambda-go => ../`.
+  It is built in CI but never released; its dependencies (SAM, AWS service clients) stay
+  out of the library's `go.mod`.
 - `CHANGELOG.md` kept by hand per release; GitHub release notes generated from it.
-- Tagging requires green `test`, `lint`, `bench` and `size` jobs on the commit.
+- Tagging requires green `test`, `deps`, `lint`, `bench` and `size` jobs on the commit.
 - `go.mod` `go` directive is only raised in a minor release and announced in the
   changelog.
+
+```mermaid
+flowchart LR
+  start(["make release VERSION=v0.2.0"]) --> cl["CHANGELOG.md entry for v0.2.0"]
+  cl --> tidy["go mod tidy (library and examples)"]
+  tidy --> ci{test, deps, lint, bench, size green?}
+  ci -- no --> stop([abort])
+  ci -- yes --> commit["commit 'chore(release): v0.2.0'"]
+  commit --> tag["one tag: v0.2.0"]
+  tag --> push["push commit and tag"]
+  push --> notes["GitHub release notes from CHANGELOG.md"]
+```
 
 ## 7. Documentation
 

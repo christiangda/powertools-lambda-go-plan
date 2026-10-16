@@ -4,10 +4,10 @@
 
 | # | Question | Decision | Where applied |
 | --- | --- | --- | --- |
-| 1 | Go floor | **Go 1.27** (`go 1.27.0` directive in every module). `encoding/json/v2` and `jsontext` are used by `internal/jsonenc`. | 01 §2 |
+| 1 | Go floor | **Go 1.27** (`go 1.27.0` directive). `encoding/json/v2` and `jsontext` are used by `internal/jsonenc`. | 01 §2 |
 | 2 | Log levels | **All six Lambda ALC levels as `slog` custom levels**: `TRACE` (-8), `DEBUG`, `INFO`, `WARN`, `ERROR`, `FATAL` (12). Emitted names are exactly Lambda's, so filtering never downgrades a line. Powertools spellings `WARNING`, `CRITICAL`, `SILENT` are accepted when parsing. | 02 §2 |
-| 3 | X-Ray | **Wrap `aws-xray-sdk-go/v2`** (AWS maintains it). The tracer is its own module so the SDK's dependencies never reach logger-only or metrics-only consumers. | 04 |
-| 4 | Independence of the utilities | **One Go module per utility** plus a compiler-enforced shared `internal` module and a root wrapper module (01 §2, with the explanation of what "independent" buys and costs). | 01 §2, 06 §6 |
+| 3 | X-Ray | **Wrap `aws-xray-sdk-go/v2`** (AWS maintains it). Only the `tracer` package imports the SDK, so it is linked only into binaries that use tracing (see decision 25 for the module layout). | 04 |
+| 4 | Independence of the utilities | **Superseded by decision 25.** Originally one Go module per utility plus a shared `internal` module and a root wrapper module. | 01 §2 |
 | 5 | Wrapper shapes | **Both** `Wrap[In, Out]` and `WrapHandler`. | 01 §4.2 |
 | 6 | Log keys | **Invocation-scoped** `AppendKeys(ctx, …)`; `log.With` for lexical scope; `PersistentAttrs` for process constants. | 02 §4 |
 | 7 | Global instances | **None in v1.** Construct in `main`, pass or use `FromContext`. | 01 §5 |
@@ -28,12 +28,18 @@ Decision 15 concerned repository visibility and license and is omitted from this
 
 | # | Question | Decision | Where applied |
 | --- | --- | --- | --- |
-| 18 | Independence as one module per utility plus a compiler-enforced shared `internal` module | **Shared `internal` module.** | 01 §2 |
+| 18 | Shared `internal` module | **Superseded by decision 25.** `internal/` is now an ordinary internal directory of the single module. | 01 §2 |
 | 19 | `SILENT` level | **Implemented**: `logger.LevelSilent = slog.Level(16)`, a threshold only; `ParseLevel("SILENT")` maps to it. | 02 §2 |
 | 20 | SDK logger adapter | **Yes**: `tracer.NewXRayLogger(*slog.Logger)` for `xray.SetLogger`. | 04 §4 |
-| 21 | Lockstep tagging | **Lockstep**: every release tags all six modules with the same version; per-module tags are Go's standard mechanism, lockstep is the convention on top (06 §6). Revisit at `v1.0.0` only if modules get separate owners. | 06 §6 |
+| 21 | Lockstep tagging | **Superseded by decision 25.** With one module there is one tag; nothing to keep in lockstep. | 06 §6 |
 | 22 | HTTP client helper | **Yes**: `tracer.HTTPClient(c)` honouring `POWERTOOLS_TRACER_CAPTURE_HTTPS_REQUESTS`, deferring to `xray.Client`. | 04 §7 |
 | 24 | Deadlines, cancellation, freeze, shutdown (raised in the internal review) | `end()` never waits on `ctx`; nothing pending between invocations; per-invocation objects never pooled; closed-state behaviour for late goroutines; `RemainingTime`/`Deadline` helpers; opt-in `DeadlineMargin` pre-timeout flush as the only timer in the library; `OpenSegments` warning. Added after the internal review. | 01 §7, 02 §9, 03 §4, 04 §5.1, 05, 06 |
+
+## Decisions taken, third round (internal review, 2026-10-16)
+
+| # | Question | Decision | Where applied |
+| --- | --- | --- | --- |
+| 25 | Versioning of the components | **One module, one version.** The repository publishes a single Go module `github.com/aizon-shared/powertools-lambda-go` with a single tag `vX.Y.Z` for every package; no per-utility modules, no shared `internal` module, no lockstep tagging, no `go.work`. `examples/` is an untagged module with a `replace` to the parent. Accepted cost: the X-Ray SDK is in every consumer's module graph, never in logger-only binaries, enforced by the `deps` CI job. Supersedes 4, 18 and 21. | 01 §2, 04 §1, 05, 06 §5 and §6, 07, 08, 11, README |
 
 No item is pending. New questions go to the pull request or to `docs/DECISIONS.md` once the
 plan is archived (11 §3).

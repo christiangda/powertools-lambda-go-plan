@@ -16,7 +16,7 @@ Consequences, all accepted:
 
 | Consequence | How the plan deals with it |
 | --- | --- |
-| The SDK pulls grpc, protobuf, fasthttp, aws-sdk-go-v2 core, route53 and x/net into the binary (R11). | The tracer is its **own module** (01 §2). Consumers who use only the logger or metrics never download or link it. Binary size and init time are measured in Phase 5 for the `examples/full` function. |
+| The SDK pulls grpc, protobuf, fasthttp, aws-sdk-go-v2 core, route53 and x/net into binaries that import `tracer` (R11), and into every consumer's module graph because the library is one module (decision 25). | Only the `tracer` package imports the SDK, enforced by the `deps` CI job (06 §5); a logger-only or metrics-only binary does not link it. Binary size and init time are measured in Phase 5 for a logger-only and a full function. |
 | The SDK keeps global mutable configuration (`xray.Configure`, `xray.SetLogger`, which is "not goroutine safe, only set from `init()`"). | `tracer.New` never touches global SDK state by default. Daemon address, emitter and strategies are left to the SDK's environment handling (`AWS_XRAY_DAEMON_ADDRESS`, `AWS_XRAY_CONTEXT_MISSING`), which Lambda sets. Tests use `xray.ContextWithConfig` for a per-context emitter instead of globals. |
 | SDK package init panics if `AWS_XRAY_DAEMON_ADDRESS` is malformed, and writes `/tmp/.aws-xray/initialized` when `LAMBDA_TASK_ROOT` is set. | Documented in the tracer package docs. Both are SDK behaviours we do not change. |
 | `xray.SdkDisabled()` reads `AWS_XRAY_SDK_DISABLED` with `os.Getenv` on every call. | Our enable check happens first and is a cached boolean; the SDK's per-call read only happens on active paths. |

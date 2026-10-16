@@ -17,76 +17,67 @@ that establishes it.
 | R8 | Valid handler shapes are `func()`, `func() error`, `func() (T, error)`, `func(In) error`, `func(In) (T, error)`, `func(ctx) error`, `func(ctx) (T, error)`, `func(ctx, In) error`, `func(ctx, In) (T, error)`, plus any value implementing `lambda.Handler` (`Invoke(ctx, []byte) ([]byte, error)`). `lambda.NewHandler` wraps a function into a `lambda.Handler` and exposes decoded request and response through `handlertrace`. | Lambda Go handler docs, `lambda/handler.go`, `lambda/handlertrace/trace.go` |
 | R9 | X-Ray in Lambda: the service creates the function segment (the "facade"); user code may only send **subsegments** with `type: "subsegment"` and `parent_id` equal to the `Parent` field of the trace header, over UDP to `AWS_XRAY_DAEMON_ADDRESS` prefixed by `{"format": "json", "version": 1}\n`. Documents are capped at 64 kB. Segment names are at most 200 characters. | X-Ray "Sending trace data", "Segment documents", `xray/lambda.go`, `xray/segment.go` |
 | R10 | EMF: at most 100 metric definitions per log event, at most 30 dimension keys per set (Powertools uses 29), at most 100 values per metric array, `Timestamp` in epoch milliseconds within 14 days past / 2 hours future, numeric values within ±2^360, namespace and names 1 to 255 printable ASCII. | EMF specification, Powertools `cloudwatch.py` constants |
-| R11 | `aws-xray-sdk-go/v2` requires Go 1.26 and depends on `grpc`, `protobuf`, `fasthttp`, `aws-sdk-go-v2`, `route53`. The tracer wraps it (decision 3), so the tracer must be a separate module: logger-only or metrics-only consumers must never link these dependencies. | `aws-xray-sdk-go` `go.mod` v2.0.4 |
+| R11 | `aws-xray-sdk-go/v2` requires Go 1.26 and depends on `grpc`, `protobuf`, `fasthttp`, `aws-sdk-go-v2`, `route53`. The tracer wraps it (decision 3). Go links only imported packages, so a binary that does not import `tracer` does not contain any of this; the SDK does appear in every consumer's module graph because the library is one module (decision 25). Only `tracer` may import the SDK, enforced in CI. | `aws-xray-sdk-go` `go.mod` v2.0.4 |
 
 ## 2. Module and package layout
 
-Decision 4: the utilities are **independent Go modules**. A consumer who wants only
-structured logging runs `go get github.com/aizon-shared/powertools-lambda-go/logger`
-and links the logger, the small shared `internal` module and `aws-lambda-go`; nothing
-from the X-Ray SDK is downloaded or compiled. A consumer who wants everything imports
-the root module, whose only package is the handler wrapper.
+Decision 25: the library is **one Go module with one version**. A single tag `vX.Y.Z`
+versions every package; there is one `go.mod`, no `go.work`, no per-utility tags and no
+release script that rewrites `require` lines. Consumers import the packages they need
+(`.../logger`, `.../metrics`, `.../tracer`, or the root `powertools` wrapper) from the
+same module version.
 
-| Module path | Package(s) | Requires |
+| Package | Imports | Linked into a binary when |
 | --- | --- | --- |
-| `github.com/aizon-shared/powertools-lambda-go` (root) | `powertools` (wrapper) | `internal`, `logger`, `metrics`, `tracer`, `aws-lambda-go` |
-| `github.com/aizon-shared/powertools-lambda-go/internal` | `invocation`, `lambdaenv`, `jsonenc`, `bufpool`, `syncwriter` | standard library, `aws-lambda-go` |
-| `github.com/aizon-shared/powertools-lambda-go/logger` | `logger` | `internal` |
-| `github.com/aizon-shared/powertools-lambda-go/metrics` | `metrics` | `internal` |
-| `github.com/aizon-shared/powertools-lambda-go/tracer` | `tracer` | `internal`, `aws-xray-sdk-go/v2` |
-| `github.com/aizon-shared/powertools-lambda-go/examples` | sample functions | all of the above, SAM |
+| `powertools` (root) | `internal/...`, `logger`, `metrics`, `tracer`, `aws-lambda-go` | the wrapper is used (all three utilities come with it) |
+| `logger` | `internal/...`, standard library | imported |
+| `metrics` | `internal/...`, standard library | imported |
+| `tracer` | `internal/...`, `aws-xray-sdk-go/v2` | imported; the only package that imports the X-Ray SDK |
+| `internal/...` | standard library, `aws-lambda-go` | any of the above |
+| `examples/...` | everything, plus SAM and AWS service clients | never: a separate, untagged module with a `replace` to the parent, so its dependencies stay out of the library |
 
-Test-only dependency in every module: `github.com/google/go-cmp` (explicitly allowed by
-the Google style guide). The metrics module also allows a test-only JSON schema
-validator (decision 13). No assertion libraries.
+Test-only dependencies: `github.com/google/go-cmp` (explicitly allowed by the Google
+style guide) and a JSON schema validator for the EMF tests (decision 13). No assertion
+libraries.
 
-### Why a shared module named `internal`
+### Why one module
 
-The Go toolchain forbids importing a package whose path contains `internal` from code
-outside the tree rooted at the parent of that `internal` element. The rule is
-path-based, not module-based, so a module at
-`github.com/aizon-shared/powertools-lambda-go/internal` can be imported by
-`…/powertools-lambda-go/logger` (a different module) but not by any consumer.
-OpenTelemetry-Go uses the same layout (`go.opentelemetry.io/otel/sdk` imports
-`go.opentelemetry.io/otel/internal/global`). This gives true independence between
-utilities, one shared implementation of the invocation state and JSON helpers, and no
-cycle in the module graph:
-
-```
-internal  ◀── logger
-internal  ◀── metrics
-internal  ◀── tracer   ◀── aws-xray-sdk-go/v2
-internal, logger, metrics, tracer  ◀── root (powertools)
-```
+- **One version.** The root wrapper, `logger`, `metrics` and `tracer` share the
+  `internal/invocation.State` contract. In one module there is nothing to mismatch: a
+  consumer at `v0.3.0` has the `v0.3.0` of every package. Powertools Python ships the
+  same way.
+- **Standard mechanics only.** Tagging is `git tag vX.Y.Z`; `go get …/powertools-lambda-go@vX.Y.Z`
+  brings every package; `internal/` is the ordinary Go visibility rule, nothing clever.
+- **The accepted cost.** The X-Ray SDK is a requirement of the module, so it appears in
+  every consumer's module graph (`go.sum` entries, Dependabot alerts for logger-only
+  users). It does **not** reach their binaries: Go links only imported packages, and only
+  `tracer` imports the SDK (the `deps` CI job in 06 §5 fails if `logger`, `metrics` or
+  `internal` ever import it). `govulncheck` reports only reachable vulnerabilities, so
+  logger-only users are not paged for SDK-only findings.
+- **Reversible.** If a later need appears (separate owners, a utility with a heavy
+  dependency that must stay optional), a package can be split into its own module at a
+  major version boundary. The decision log records why it is not done now.
 
 ```mermaid
 flowchart TB
-  subgraph consumers["consumer binaries"]
-    c1["logger only"]
-    c2["everything"]
+  subgraph graph["every consumer's module graph (go.mod, go.sum)"]
+    g["powertools-lambda-go vX.Y.Z<br/>aws-lambda-go<br/>aws-xray-sdk-go/v2 and its tree"]
   end
-  c1 --> logger
-  c2 --> root
-  root["root (powertools)"] --> logger & metrics & tracer & internal
-  logger --> internal
-  metrics --> internal
-  tracer --> internal
-  tracer --> xray["aws-xray-sdk-go/v2"]
-  internal --> lambdago["aws-lambda-go"]
-  root --> lambdago
+  subgraph binaries["what each binary actually links"]
+    b1["imports logger only:<br/>logger, internal, aws-lambda-go"]
+    b2["imports logger and metrics:<br/>+ metrics"]
+    b3["imports the wrapper or tracer:<br/>+ tracer, X-Ray SDK and its tree"]
+  end
+  g --> b1
+  g --> b2
+  g --> b3
   classDef heavy fill:#fde2e2,stroke:#c0392b,color:#000;
-  class xray heavy;
+  class b3 heavy;
 ```
-
-What independence buys: smaller binaries and faster cold starts for partial use, no
-X-Ray SDK for logger/metrics users, separate semantic versions when a module needs a
-breaking change. What it costs: six `go.mod` files, a `go.work` for development,
-lockstep tagging on release (06 §6, decision 21), and the rule that `internal`
-never imports a utility. Decision 18 confirms this layout.
 
 ### Go version floor
 
-Decision 1: every module declares `go 1.27.0`. `encoding/json/v2` and
+Decision 1: the module declares `go 1.27.0` (and so does `examples/go.mod`). `encoding/json/v2` and
 `encoding/json/jsontext` (GA in 1.27) back `internal/jsonenc`: `jsontext.AppendQuote`
 for strings, `json.MarshalWrite` for arbitrary values, with no hand-rolled escaping.
 
@@ -221,7 +212,7 @@ package invocation // internal; imported by root, logger, metrics and tracer
 // assertion allocates nothing). Fields are shown here in logical order; the final
 // order is decided by betteralign (05 §4) to minimise padding and GC scan bytes.
 // Contract rule: within a major version fields are only ever added, never renamed,
-// retyped or removed, because three modules read this struct (11 §2).
+// retyped or removed, because three packages read this struct (11 §2).
 type State struct {
     // Immutable after begin(). Safe to read from any goroutine without locking.
     RequestID    string
