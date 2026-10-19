@@ -4,41 +4,96 @@ A `log/slog` handler that writes Powertools-shaped JSON lines. Consumers use the
 `*slog.Logger` API; the only Powertools-specific calls are for invocation-scoped keys,
 correlation IDs and the buffer.
 
+> **About the implementation notes.** This plan was implemented by a reference
+> implementation and released as v1.0.0. Paragraphs marked **Validated in
+> implementation** confirm a choice of this plan; paragraphs marked **Changed after
+> implementation** correct the plan where the implementation proved it wrong, ambiguous or
+> too literal, with the reason. §14 shows how callers use the intended API.
+
 ## 1. Output format
 
 One JSON object per line, written with a single `Write`. Key order is fixed for the
-standard keys (cosmetic, but it matches upstream and makes log tailing readable).
+standard keys (cosmetic, but it matches upstream and makes log tailing readable). The
+table lists the keys in the order they are emitted (§5 gives the algorithm).
 
 | Key | Type | When | Source |
 | --- | --- | --- | --- |
 | `level` | string | always | one of `TRACE DEBUG INFO WARN ERROR FATAL` (see §2) |
 | `message` | string | always | `slog.Record.Message` |
-| `timestamp` | string | always | RFC 3339 with milliseconds, UTC: `2026-10-15T14:48:00.000Z` |
+| `timestamp` | string | `r.Time` is non-zero | RFC 3339 with milliseconds, UTC: `2026-10-15T14:48:00.000Z` |
 | `service` | string | always | `Options.Service` / `POWERTOOLS_SERVICE_NAME` / `service_undefined` |
 | `sampling_rate` | number | when rate > 0 | `Options.SampleRate` |
-| `cold_start` | bool | wrapper in use | `State.ColdStart` |
+| `location` | string | `Options.AddSource` and `r.PC != 0` | `main.handle:42`: the import-path-qualified function name (`github.com/acme/app/orders.reserve` outside `main`), `:`, the line; mirrors Python's `location: "collect.handler:9"` |
+| persistent attrs | any | always | `Options.PersistentAttrs` and `logger.With(...)` before the first `WithGroup` |
+| `cold_start` | bool | wrapper in use (all five Lambda keys always, `""` and `0` included) | `State.ColdStart` |
 | `function_name` | string | wrapper in use | `lambdacontext.FunctionName` |
 | `function_memory_size` | number | wrapper in use | `lambdacontext.MemoryLimitInMB` |
 | `function_arn` | string | wrapper in use | `State.FunctionARN` |
 | `function_request_id` | string | wrapper in use | `State.RequestID` |
-| `xray_trace_id` | string | trace header present | `State.Trace.Root`; falls back to `_X_AMZN_TRACE_ID` per R2 |
+| `xray_trace_id` | string | trace header present | `State.Trace.Root`, parsed from `ctx.Value("x-amzn-trace-id")` only |
 | `correlation_id` | string | set | `State.CorrelationID` |
-| `location` | string | `Options.AddSource` | `main.handle:42` (function name and line, mirroring Python's `location: "collect.handler:9"`) |
-| persistent attrs | any | always | `Options.PersistentAttrs` and `logger.With(...)` |
 | invocation attrs | any | set | `logger.AppendKeys(ctx, …)` |
-| record attrs | any | per call | `log.Info("msg", "k", v)` |
+| grouped attrs | any | set | `logger.With(...)` after a `WithGroup`, inside their groups |
+| record attrs | any | per call | `log.Info("msg", "k", v)`, inside the open groups |
 | `error` | object | an attr value is `error` | `{"name": "*fs.PathError", "message": "...", "cause": [...]}` (see §7) |
+
+> **Changed after implementation.** Three rows moved or changed. (1) The persistent and
+> `With` attrs come **before** the Lambda keys and `location` comes right after
+> `sampling_rate`: the handler writes its pre-rendered prefix in one piece, and the Lambda
+> and invocation keys must stay at the top level even when a `WithGroup` is open, so the
+> pre-rendered part is split into "before the first group" and "from the first group on"
+> (§5). (2) `timestamp` is omitted for a zero `r.Time` and `location` for a zero `r.PC`:
+> `testing/slogtest` requires both rules. Records built by `*slog.Logger` and by the package
+> functions always carry a time, so production lines always have `timestamp`. (3) The
+> `_X_AMZN_TRACE_ID` fallback is removed: aws-lambda-go puts the header in the context on
+> every invocation, and reading the environment per invocation is both slower and wrong
+> when several invocations share a process. A missing or empty value means no trace and
+> no key.
 
 Timestamp layout follows the TypeScript edition and satisfies ALC (R5). Python's default
 (`2021-05-03 10:20:19,650+0000`) is **not** RFC 3339 and would make Lambda re-stamp and
 re-level the line; it is not offered.
 
-Reserved keys: if a consumer attr uses `level`, `message`, `timestamp`, `service`,
-`sampling_rate` or `xray_trace_id`, the handler drops the attr and emits one warning per
-process (TypeScript behaviour). Lambda context keys may be overridden by consumer attrs
-to allow redaction.
+Reserved keys: if a top-level consumer attr (record attr, `With` attr or
+`PersistentAttrs` before the first group, after `ReplaceAttr`, or an `AppendKeys` attr)
+uses `level`, `message`, `timestamp`, `service`, `sampling_rate` or `xray_trace_id`, the
+handler drops the attr. Top level means depth 0 of the output object, including the
+members of an empty-key group inlined there. Inside a keyed group there is no collision,
+so nothing is dropped.
 
-Dev mode (`POWERTOOLS_DEV=true`): indented output. Never on in Lambda.
+> **Changed after implementation.** The warning is written **once per handler family**
+> (the handler returned by one `NewHandler` call and every handler derived from it, an
+> `atomic.Bool` in the shared config), not once per process: a per-process flag would be
+> package-level mutable state, which the architecture forbids. Later drops are silent.
+> Because the reserved set is constant, the rendered `AppendKeys` cache stays independent
+> of the handler that rendered it, and `level` can never be duplicated, which matters for
+> ALC.
+
+Duplicate keys: every other collision is emitted as `slog.JSONHandler` emits it. A
+consumer attr named like a Lambda key (`function_name`), an `AppendKeys` attr repeated
+with the same key, or a record attr that repeats a `With` attr produces a second member
+with the same name. Decoders that keep the last member see the later value.
+
+> **Changed after implementation.** The earlier sentence "Lambda context keys may be
+> overridden by consumer attrs to allow redaction" is withdrawn. Overriding would need a
+> per-record deduplication pass (a cost on every line) and would hide data silently.
+> Nothing is deduplicated and nothing is hidden: this is not a redaction mechanism;
+> `ReplaceAttr` is (§3). Every decoder the library owns (tests, the dev pretty-printer)
+> uses `jsontext.AllowDuplicateNames(true)` and `jsontext.AllowInvalidUTF8(true)`.
+
+Single-line guarantee: a finished line never contains a raw `\n` or `\r`. Only a verbatim
+`jsontext.Value` can bring one (a pretty-printed raw event, for example); such a line is
+compacted with `jsontext.AppendFormat` (no indent options, plus the two options above and
+`jsontext.PreserveRawStrings(true)`, so escapes such as `"é"` survive byte for byte).
+Any other line is written with no copy.
+
+Dev mode (`POWERTOOLS_DEV=true` or `Options.Pretty`): the finished line is re-formatted
+with `jsontext.AppendFormat` and `jsontext.WithIndent`, plus the options above, so a line
+with duplicate keys or invalid UTF-8 never fails to print.
+
+> **Changed after implementation.** "Never on in Lambda" is enforced, not just advised:
+> `Pretty` and `POWERTOOLS_DEV` are ignored when `AWS_LAMBDA_FUNCTION_NAME` is set,
+> because an indented line becomes several CloudWatch log events and breaks ALC.
 
 Example:
 
@@ -64,6 +119,10 @@ re-levels a line.
 | `logger.LevelFatal` | `slog.Level(12)` | `FATAL` | `FATAL`, `CRITICAL` (Powertools) |
 | `logger.LevelSilent` | `slog.Level(16)` | threshold only; nothing should log at it | `SILENT` (decision 19) |
 
+> **Validated in implementation.** Six plain `slog.Level` constants plus the `LevelSilent`
+> threshold were enough: no wrapper type, no custom `Leveler`, and `ParseLevel` round-trips
+> every upstream spelling (`trace`, `WARNING`, `Critical`, `silent`) case-insensitively.
+
 - `ParseLevel(s string) (slog.Level, error)` is exported; it is case-insensitive and
   returns `ErrInvalidLevel` otherwise. It is what reads `POWERTOOLS_LOG_LEVEL` and
   `AWS_LAMBDA_LOG_LEVEL`.
@@ -76,9 +135,14 @@ re-levels a line.
   A Lambda handler returns its error; the runtime reports it.
 - `LevelSilent` is a threshold, not a level to log at. `Options.Level = logger.LevelSilent`
   or `POWERTOOLS_LOG_LEVEL=SILENT` makes `Enabled` false for every record, including
-  `FATAL`, with zero cost per call. There is no `Silent` package function; a record
-  logged explicitly at that level would print `SILENT`, which Lambda treats as `INFO`,
-  and the library never does that.
+  `FATAL` and including debug-sampled invocations (§6), with zero cost per call. There is
+  no `Silent` package function.
+
+> **Changed after implementation.** A record logged explicitly at `LevelSilent` prints
+> `ERROR+8`, the `LevelName` fallback, not `SILENT`: `SILENT` is not an ALC level name, so
+> giving it a name would only invite misuse. Lambda treats such a line as `INFO`, and the
+> library never logs at that level. `LevelSilent` also wins over debug sampling, which
+> the earlier text did not say.
 
 ### Package functions (the custom-logger shape)
 
@@ -94,9 +158,9 @@ const (
     LevelSilent = slog.Level(16) // threshold only
 )
 
-// Each function resolves the invocation's logger from ctx (FromContext) and calls
-// Logger.Log with the matching level, exactly like slog.Log but with the Powertools
-// levels. Example: logger.Trace(ctx, "cache lookup", "key", k)
+// Each function resolves the invocation's logger from ctx (FromContext) and builds the
+// record itself, so that "location" names the caller and not this package.
+// Example: logger.Trace(ctx, "cache lookup", "key", k)
 func Trace(ctx context.Context, msg string, args ...any)
 func Debug(ctx context.Context, msg string, args ...any)
 func Info(ctx context.Context, msg string, args ...any)
@@ -106,13 +170,28 @@ func Fatal(ctx context.Context, msg string, args ...any)
 func Log(ctx context.Context, level slog.Level, msg string, args ...any)
 ```
 
-These are sugar over `FromContext(ctx).Log(ctx, level, msg, args...)`; they allocate
-nothing beyond what `slog.Logger.Log` allocates and they respect `Enabled` before
-building the record. When no invocation is in `ctx`, `FromContext` returns
-`slog.Default()`, which is `slog`'s own mechanism and the only process-wide fallback
-the package uses (decision 7).
+> **Changed after implementation.** The functions are **not** sugar over
+> `FromContext(ctx).Log(...)`: `slog.Logger.Log` records its own caller, which would be the
+> package function, so `location` would always name `logger.Info`. Each function follows
+> the "wrapping output methods" pattern of the `log/slog` package documentation: check
+> `Enabled`, capture one PC with `runtime.Callers(2, ...)`, build the record with
+> `slog.NewRecord`, call `Handle`. No helper sits between the caller and
+> `runtime.Callers`, so the skip is always 2, and a test pins that `location` names the
+> caller.
 
-Level precedence and the ALC warning are specified in 01 §3.
+Cost: the variadic `args ...any` is boxed at the call site, before `Enabled` runs. A
+non-constant value costs one allocation per value, enabled or disabled, exactly as with
+`slog.Logger.Info` (small integers are boxed without allocation by the Go runtime). Hot
+paths use `logger.FromContext(ctx).LogAttrs(ctx, level, msg, slog.Int(...), ...)`, which
+costs nothing for up to five scalar attrs (§12).
+
+When no invocation is in `ctx`, or the invocation carries no logger (the wrapper was
+built without one), `FromContext` returns `slog.Default()`, which is `slog`'s own
+mechanism and the only process-wide fallback the package uses (decision 7). The
+wrapper's own diagnostics (event line, pre-timeout warning, panic line with its stack) use
+the same lookup, so they are never dropped.
+
+Level precedence and the ALC warning are specified in 01 §3 and in §10.
 
 ## 3. Options and constructors
 
@@ -120,24 +199,24 @@ Level precedence and the ALC warning are specified in 01 §3.
 package logger
 
 type Options struct {
-    Service         string          // POWERTOOLS_SERVICE_NAME
-    Level           slog.Leveler    // nil ⇒ env / INFO. A *slog.LevelVar makes it changeable at runtime.
-    SampleRate      float64         // POWERTOOLS_LOGGER_SAMPLE_RATE, 0..1
-    Writer          io.Writer       // nil ⇒ os.Stdout. Wrapped by internal/syncwriter.
-    PersistentAttrs []slog.Attr     // rendered once; appear on every line
+    Service         string          // POWERTOOLS_SERVICE_NAME, else "service_undefined"
+    Level           slog.Leveler    // nil ⇒ env / INFO. A *slog.LevelVar makes it changeable at runtime. Ignored under ALC.
+    SampleRate      float64         // POWERTOOLS_LOGGER_SAMPLE_RATE, 0..1; applied only under the wrapper (§6)
+    Writer          io.Writer       // nil ⇒ the shared stdout writer; otherwise wrapped by its own syncwriter
+    PersistentAttrs []slog.Attr     // rendered once, like an initial With; appear on every line
     AddSource       bool            // "location" key; costs a runtime.CallersFrames per record
     Location        *time.Location  // nil ⇒ UTC
-    TimestampLayout string          // "" ⇒ "2006-01-02T15:04:05.000Z07:00"
-    ReplaceAttr     func(groups []string, a slog.Attr) slog.Attr  // same contract as slog.HandlerOptions
+    TimestampLayout string          // "" ⇒ "2006-01-02T15:04:05.000Z07:00"; must not need JSON escaping
+    ReplaceAttr     func(groups []string, a slog.Attr) slog.Attr  // consumer attrs only (see below)
     Buffer          BufferOptions
-    Pretty          *bool           // nil ⇒ POWERTOOLS_DEV
+    Pretty          *bool           // nil ⇒ POWERTOOLS_DEV; ignored in Lambda
 }
 
 type BufferOptions struct {
     Enabled          bool
-    MaxBytes         int        // 0 ⇒ 20480
-    BufferAtLevel    slog.Level // records at or below this level are buffered; default DEBUG
-    FlushOnErrorLog  bool       // default true when Enabled
+    MaxBytes         int          // 0 ⇒ 20480
+    BufferAtLevel    slog.Leveler // nil ⇒ DEBUG; records at or below this level are buffered
+    FlushOnErrorLog  *bool        // nil ⇒ true; new(false) turns it off
 }
 
 func New(opts Options) *slog.Logger          // slog.New(NewHandler(opts))
@@ -150,23 +229,74 @@ func (h *Handler) Level() slog.Level         // effective level after ALC preced
 func (h *Handler) SampleRate() float64       // used by the wrapper for the per-invocation decision
 ```
 
+> **Changed after implementation.** `BufferAtLevel` is a `slog.Leveler` and
+> `FlushOnErrorLog` a `*bool`, so the zero `BufferOptions` stays usable: a plain
+> `slog.Level` zero value is `INFO`, not the intended `DEBUG`, and a plain `bool` cannot
+> express "default true". A `Leveler` also lets a `*slog.LevelVar` change the buffered
+> level at runtime (it is read per record).
+
+Resolution rules applied by `NewHandler`, which reads the environment once (tests can use
+`t.Setenv` before constructing; nothing reads the environment per record):
+
+- Level (01 §3): `AWS_LAMBDA_LOG_LEVEL`, else `Options.Level`, else `POWERTOOLS_LOG_LEVEL`,
+  else `INFO`. When ALC applies, `Options.Level` is ignored, a `*slog.LevelVar` included.
+  An environment value that is empty after trimming is unset and never warns. A non-empty
+  value that `ParseLevel` rejects is ignored (the next rung applies) and produces one
+  construction `WARN` naming the variable and the value. Both level variables are
+  validated even when a higher rung wins, so a typo in the deployment configuration is
+  reported whichever rung decides the level.
+- `TimestampLayout`: the formatted time is appended raw between quotes, so a layout
+  containing `"`, `\` or a byte below 0x20 is replaced by the default with one
+  construction `WARN`. This goes beyond decision 10's doc warning: a doc warning cannot
+  stop a malformed line.
+- Construction warnings (invalid level variables, invalid layout, then the ALC warning of
+  §10) are written once the handler exists, through its writer, bypassing the level gate
+  except under `LevelSilent`. They never go through `ReplaceAttr`, `With` attrs or groups.
+
 `New` returns `*slog.Logger` on purpose: there is no `logger.Logger` type, so consumers
 and third-party libraries (`net/http`, AWS SDK logging adapters) interoperate through the
 standard type. `NewHandler` is exported so consumers can compose it
 (`slog.NewMultiHandler(powertoolsHandler, otherHandler)`, Go 1.26).
 
+> **Validated in implementation.** No `logger.Logger` type was ever needed: every feature
+> (levels, invocation keys, buffering, correlation IDs) fits behind `*slog.Logger` plus
+> context-taking package functions, and `slog.NewMultiHandler` composition works with the
+> shared per-invocation caches.
+
+Writer: when `Options.Writer` is nil the handler uses one package-level, mutex-guarded
+stdout writer that the logger and metrics share (one of the allowed package-level
+variables, 01 §5), so a log line and an EMF blob never interleave. A writer supplied by
+the consumer is wrapped per handler and is not shared between utilities.
+
+ReplaceAttr: unlike `slog.HandlerOptions.ReplaceAttr`, it applies to consumer attrs only.
+
+| Attrs | Seen by `ReplaceAttr` | When |
+| --- | --- | --- |
+| record attrs | yes | in `Handle`, with the groups open at that point |
+| `With` attrs and `PersistentAttrs` | yes | once, in `WithAttrs` / `NewHandler`, with the groups open then |
+| built-in keys (`level`, `message`, `timestamp`, `service`, `sampling_rate`, `xray_trace_id`, `location`) | no | written by the handler; ALC needs `level` and `timestamp` |
+| Lambda keys and `correlation_id` | no | cached once per invocation in `State.LambdaJSON` |
+| `AppendKeys` attrs | no | cached per version in `State.AttrsJSON` |
+
+> **Changed after implementation.** The plan said "same contract as
+> `slog.HandlerOptions`". Applying `ReplaceAttr` to the cached invocation blocks would make
+> them handler-specific, and a `MultiHandler` (or two handlers with different `Options`)
+> logging in one invocation would then need one cache per handler. Restricting it to
+> consumer attrs keeps the caches shared and keeps ALC's `level` and `timestamp` intact.
+
 ## 4. Invocation-scoped API
 
 ```go
-// FromContext returns a logger bound to the invocation: the handler reads invocation
-// state from ctx on every call, so this is simply the configured logger. It exists so
-// code deep in the call graph does not need the *slog.Logger passed around; it falls
-// back to slog.Default() when the wrapper is not in use.
+// FromContext returns the invocation's configured logger. The handler reads invocation
+// state from ctx on every call, so code deep in the call graph does not need the
+// *slog.Logger passed around. It returns slog.Default() when ctx carries no invocation
+// or the invocation has no logger.
 func FromContext(ctx context.Context) *slog.Logger
 
 // AppendKeys adds attrs visible to every log line of this invocation, from any goroutine
 // holding ctx. Equivalent to Powertools appendKeys / append_keys but scoped to the
-// invocation instead of the process (R4).
+// invocation instead of the process (R4). Keys are not deduplicated: appending the same
+// key twice emits two members (§1). RemoveKeys removes every attr with that key.
 func AppendKeys(ctx context.Context, attrs ...slog.Attr)
 func RemoveKeys(ctx context.Context, keys ...string)
 func ResetKeys(ctx context.Context)
@@ -175,7 +305,7 @@ func Keys(ctx context.Context) []slog.Attr   // snapshot copy
 func SetCorrelationID(ctx context.Context, id string)
 func CorrelationID(ctx context.Context) string
 
-func FlushBuffer(ctx context.Context)        // write buffered records in order, then clear
+func FlushBuffer(ctx context.Context)        // write buffered records in order to the buffer's writer, then clear
 func ClearBuffer(ctx context.Context)        // drop buffered records
 ```
 
@@ -184,81 +314,136 @@ are "visible to subsequent logs in this request, including the caller's logger",
 needs shared per-invocation state. Lexical scoping is still available through
 `log.With(...)`, which the handler pre-renders once.
 
+The invocation state is created fresh for every invocation, so keys never carry into the
+next one. A wrapper option to reset keys at the end would be a no-op and is not offered;
+`ResetKeys(ctx)` is for consumers who want to clear them mid-invocation.
+
+> **Validated in implementation.** All of these functions are no-ops (or return zero
+> values) without an invocation in `ctx`, so library code can call them unconditionally.
+> A top-level `slog.LogValuer` passed to `AppendKeys` is resolved once, outside the
+> invocation lock, as `slog.Logger.With` does. The rest of the rendering runs under that
+> lock, so consumer code that runs there (`MarshalJSON` of a `KindAny` value, `Error` of
+> an error value, a `LogValuer` nested in a group) must not call these functions or log
+> with the invocation's context; the package documentation states this lock contract.
+> `AppendKeys` of one attr measured 0 allocations and about 25 ns in the reference
+> implementation; the next record re-renders the cache once and then costs nothing
+> extra.
+
 ## 5. Handler internals (performance-driven)
 
-Follows the slog handler guide: pre-format what can be pre-formatted, allocate once per
-record from a pool, write once.
+Follows the slog handler guide and the structure of slog's own `commonHandler`:
+pre-format what can be pre-formatted, allocate once per record from a pool, write once.
 
 ```go
 type Handler struct {
-    cfg       config          // immutable
-    w         *syncwriter.Writer
-    level     slog.Leveler
-    preAttrs  []byte          // rendered PersistentAttrs + WithAttrs chain, e.g. `,"env":"prod"`
-    groups    []string        // open groups from WithGroup
-    preGroups []byte          // rendered `,"g1":{"g2":{` prefix for record attrs
-    nOpen     int             // braces to close
+    cfg            *config             // immutable, shared by derived handlers: writer, level, layout, ...
+    opts           jsonenc.AttrOptions // ReplaceAttr, the reserved set, every open group
+    topAttrs       []byte   // PersistentAttrs + With attrs before the first WithGroup, e.g. `,"env":"prod"`
+    groupedPrefix  []byte   // from the first opened group onward, with the With attrs inside it, e.g. `,"G":{"c":"d"`
+    trailingGroups []string // groups with no attrs yet; opened in Handle only if a record attr renders
+    nOpened        int      // groups opened in groupedPrefix (braces to close)
 }
 ```
+
+> **Changed after implementation.** The plan's single `preAttrs` / `preGroups` pair
+> could not satisfy two rules at once: the Lambda and invocation keys must stay at the top
+> level, and `slogtest` requires that a group with no attrs never renders (`"G":{}`). The
+> pre-rendered part is therefore split in two, and trailing empty groups are opened lazily,
+> exactly as slog's `commonHandler` does.
+
+- `WithGroup(name)` records the group; it writes nothing.
+- `WithAttrs(attrs)` renders the attrs (through `ReplaceAttr`). If no group is open they go
+  to `topAttrs` (the reserved-key rule applies there). Otherwise it writes the trailing
+  groups and the attrs into a copy of `groupedPrefix`, and commits the groups only when at
+  least one attr renders, so `l.WithGroup("G").With(slog.Attr{})` never emits `"G":{}`.
+- `WithGroup("")` and `WithAttrs` with zero attrs return the receiver.
+- Both copy on write and allocate; they run when loggers are derived, not per record.
 
 `Handle(ctx, r)`:
 
 1. `s := invocation.FromContext(ctx)` (one lookup, may be nil).
-2. `buf := bufpool.Get()`; append `{"level":"`, level name, `","message":`, quoted
-   message, `,"timestamp":"`, `r.Time.UTC().AppendFormat(...)`, `","service":"…"`.
-3. Append `h.preAttrs`.
-4. If `s != nil`: append `s.LambdaJSON` (rendered lazily once per invocation and cached
-   in `State`: `cold_start`, `function_*`, `xray_trace_id`), then `correlation_id` if set,
-   then `s.AttrsJSON` (cached by `AttrsVersion`, re-rendered only after `AppendKeys`;
-   the snapshot is taken under `s.Mu` and released before the write).
-5. Append `h.preGroups`, then each record attr via `jsonenc.AppendAttr` (resolves
-   `LogValuer`, handles groups, applies `ReplaceAttr`, renders `error` values per §7),
-   then closing braces, then `}\n`.
-6. If buffering applies (§9): copy into the invocation buffer; else `h.w.Write(buf)`.
-7. `bufpool.Put(buf)`.
+2. `buf := bufpool.Get()`. Header: level name, quoted message, `timestamp` only when
+   `!r.Time.IsZero()`, `service`, `sampling_rate` when the rate is above 0, `location` when
+   `AddSource` and `r.PC != 0`.
+3. Append `h.topAttrs`.
+4. If `s != nil`, in **one** critical section of the invocation mutex (the bytes are
+   copied into the line while the lock is held, so a concurrent re-render by another
+   handler is never seen half written): `s.LambdaJSON` (rendered lazily once per
+   invocation), then `correlation_id` if set, then `s.AttrsJSON` (re-rendered only when
+   its stored version differs from `s.AttrsVersion`).
+5. Append `h.groupedPrefix`.
+6. Record attrs via `jsonenc.AppendAttr`: resolves `LogValuer`, applies `ReplaceAttr`,
+   follows slog's rules (an empty `Attr{}` is dropped, a group with no attrs is dropped, a
+   group with an empty key is inlined), drops reserved top-level keys and renders `error`
+   values per §7. The trailing groups are opened before the first attr that renders.
+7. Close exactly the groups that were opened, then `}`.
+8. Finish the line: dev-mode indent, or single-line compaction when needed (§1); then `\n`.
+9. A record at `ERROR` or above with `FlushOnErrorLog` on first flushes the invocation
+   buffer, unless the invocation is closed (§9). If buffering applies, copy into the
+   invocation buffer; else one `Write` to the handler's writer, whose error `Handle`
+   returns (slog convention). Flush and warning writes ignore theirs.
+10. `bufpool.Put(buf)`, storing the grown slice back so a long line keeps its capacity.
 
 ```mermaid
 flowchart TD
-  call["log.Info(msg, attrs...)"] --> en{Enabled?<br/>level at or above threshold<br/>or DEBUG sampled this invocation}
+  call["log.Info(msg, attrs...)"] --> en{Enabled?<br/>level at or above threshold<br/>or threshold below SILENT and<br/>DEBUG sampled this invocation}
   en -- no --> drop([return, 0 allocs])
-  en -- yes --> rec["slog builds Record"] --> buf["buf := bufpool.Get()"]
-  buf --> head["level, message, timestamp, service"]
-  head --> pre["h.preAttrs<br/>(PersistentAttrs + With chain, pre-rendered)"]
-  pre --> st{State in ctx?}
-  st -- yes --> lam["State.LambdaJSON (cached once per invocation)<br/>correlation_id<br/>State.AttrsJSON (cached by AttrsVersion)"]
-  st -- no --> attrs
-  lam --> attrs["record attrs via jsonenc<br/>(groups, ReplaceAttr, error objects)"]
-  attrs --> close["close groups, '}\n'"]
-  close --> b{buffering applies?<br/>level at or below BufferAtLevel,<br/>not cold start}
+  en -- yes --> rec["Record built by slog<br/>or by the package function"] --> buf["buf from bufpool"]
+  buf --> head["header: level, message,<br/>timestamp if time is set, service,<br/>sampling_rate, location if PC is set"]
+  head --> top["h.topAttrs<br/>PersistentAttrs and With attrs<br/>before the first group"]
+  top --> st{State in ctx?}
+  st -- yes --> lam["top level: State.LambdaJSON<br/>correlation_id<br/>State.AttrsJSON by AttrsVersion"]
+  st -- no --> gp
+  lam --> gp["h.groupedPrefix<br/>groups that already hold With attrs"]
+  gp --> attrs["record attrs via jsonenc<br/>ReplaceAttr, error objects<br/>trailing groups opened only<br/>if an attr renders"]
+  attrs --> close["close the opened groups<br/>and the object"]
+  close --> fin["finish line: dev-mode indent<br/>or single-line compaction,<br/>then newline"]
+  fin --> fe{ERROR or above with FlushOnErrorLog<br/>and invocation not closed?}
+  fe -- yes --> fl["flush the buffer first"] --> b
+  fe -- no --> b
+  b{buffering applies?<br/>State present, not cold start,<br/>not closed, level at or below<br/>BufferAtLevel, not ERROR+ while<br/>FlushOnErrorLog is on}
   b -- yes --> lb["append to State.LogBuffer"]
-  b -- no --> w["syncwriter.Write(buf) (one syscall)"]
-  lb --> put["bufpool.Put(buf)"]
+  b -- no --> w["one syncwriter Write"]
+  lb --> put["return buf to bufpool"]
   w --> put
   put --> done([done])
 ```
 
-`Enabled(ctx, l)`: `l >= h.Level() || (l >= slog.LevelDebug && s != nil && s.DebugSampled)`.
-No allocation; no lookup when the level alone decides.
+`Enabled(ctx, l)`:
+`l >= h.Level() || (h.Level() < LevelSilent && l >= slog.LevelDebug && s != nil && s.DebugSampled)`.
+The level checks run first and `s` is looked up only when they pass, so a record below the
+threshold costs no lookup and `LevelSilent` costs nothing per call even when sampling is
+configured. No allocation.
 
 JSON string escaping and number formatting come from `internal/jsonenc`, backed by
 `encoding/json/jsontext.AppendQuote` and `strconv` (decisions 1 and 23).
-Arbitrary `slog.KindAny` values use `encoding/json/v2` (`json.MarshalWrite` into the same
-buffer); this is the only allocation-heavy path and it is only taken for non-scalar values.
+Arbitrary `slog.KindAny` values and nested values use `encoding/json/v2`, marshalled into
+a scratch region at the end of the same buffer with `jsontext.AllowInvalidUTF8(true)`.
+This is the only allocation-heavy path and it is only taken for non-scalar values.
 Values of type `jsontext.Value` are copied verbatim after `IsValid` (decision 23).
 
-`WithAttrs` returns a new `*Handler` with `preAttrs` extended (copy-on-write; the original
-is untouched). `WithGroup` extends `groups`/`preGroups`. Both allocate; they are called
-when loggers are derived, not per record.
+> **Changed after implementation.** `encoding/json/v2` rejects values that v1 accepted
+> (`time.Duration` has no default representation, a `chan`, a struct with no exported
+> fields such as an `errors.errorString` nested in a map). On a marshal error the buffer
+> is truncated back to the start of the value and the quoted string `"!ERROR:<err>"` is
+> written instead, as `slog.JSONHandler` does; an invalid `jsontext.Value` gets the same
+> string. The line is never dropped and never left half written.
 
 ## 6. Sampling
 
 - Decision per invocation in `begin`: `DebugSampled = rate > 0 && rand.Float64() < rate`
   using `math/rand/v2` (non-cryptographic is fine; it is a sampling decision).
-- Without the wrapper, consumers call `logger.RefreshSampleRate(ctx)`; this mirrors
-  `refreshSampleRateCalculation`.
+- `LevelSilent` wins over sampling: the sampling branch of `Enabled` requires
+  `h.Level() < LevelSilent` (§5).
 - `sampling_rate` key is emitted on every line when rate > 0 (upstream behaviour).
 - ALC still filters after us (R5): if ALC is `INFO`, sampled `DEBUG` lines are dropped by
   Lambda. Documented, not worked around.
+
+> **Changed after implementation.** `logger.RefreshSampleRate(ctx)` is removed from v1:
+> **sampling requires the wrapper**. Without it there is no invocation state, so there is
+> nowhere race-free to store the decision, and `SampleRate` has no effect on which records
+> are enabled (the `sampling_rate` key is still written). A process-wide flag would leak
+> the decision between concurrent invocations.
 
 ## 7. Errors in attributes
 
@@ -278,32 +463,66 @@ A record attr whose value is an `error` (`slog.KindAny`) renders as an object:
 `log.Error("msg", "err", err)` and `log.Error("msg", slog.Any("error", err))` both work;
 the key name is whatever the consumer chose.
 
+> **Validated in implementation**, with one clarification: the object form applies only
+> when the attr value itself is an `error`. An error nested in a struct or a map goes
+> through the `KindAny` path of §5, which `encoding/json/v2` usually rejects, so that
+> value renders as `"!ERROR:<err>"` and the rest of the line is intact. Consumers log
+> errors as their own attr.
+
 ## 8. Event logging and correlation IDs
 
-- Event logging is a wrapper feature (`Options.LogEvent` or `POWERTOOLS_LOGGER_LOG_EVENT`).
-  With `WrapHandler` the raw payload bytes are embedded verbatim as the `event` value
-  (a `jsontext.Value`, zero decode, zero re-encode; validated once with
-  `IsValid(jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true))` so a
-  payload Lambda accepted is never rejected by the stricter v2 defaults). With `Wrap[In, Out]` the typed value
-  is marshalled with `encoding/json/v2` (`json.Marshal`), which costs one marshal only
-  when event logging is on.
-- Correlation ID extraction order: `Options.CorrelationIDFunc` (typed, no cost) >
-  `Options.CorrelationIDPath` evaluated by `internal/jsonpath` on the raw bytes
-  (`WrapHandler`) or on a marshalled copy (`Wrap`, cost documented) > none.
-- Built-in paths, as string constants in package `logger` (`CorrelationPathAPIGatewayREST`
-  etc.):
+Both are wrapper features (01 §4.2). `WrapHandler` only accepts hand-written
+`lambda.Handler` implementations that own the bytes they return.
 
-| Constant | Path |
-| --- | --- |
-| `API_GATEWAY_REST` | `requestContext.requestId` |
-| `API_GATEWAY_HTTP` | `requestContext.requestId` |
-| `APPSYNC_AUTHORIZER` | `requestContext.requestId` |
-| `APPSYNC_RESOLVER` | `request.headers."x-amzn-trace-id"` |
-| `APPLICATION_LOAD_BALANCER` | `headers."x-amzn-trace-id"` |
-| `EVENT_BRIDGE` | `id` |
-| `LAMBDA_FUNCTION_URL` | `requestContext.requestId` |
-| `S3_OBJECT_LAMBDA` | `xAmzRequestId` |
-| `VPC_LATTICE` | `headers."x-amzn-trace-id"` |
+- Event logging (`Options.LogEvent` or `POWERTOOLS_LOGGER_LOG_EVENT`). With `WrapHandler`
+  the raw payload bytes are embedded verbatim as the `event` value (a `jsontext.Value`,
+  zero decode, zero re-encode; validated once with
+  `IsValid(jsontext.AllowDuplicateNames(true), jsontext.AllowInvalidUTF8(true))` so a
+  payload Lambda accepted is never rejected by the stricter v2 defaults). With
+  `Wrap[In, Out]` the typed value is marshalled with `encoding/json/v2` (`json.Marshal`),
+  which costs one marshal only when event logging is on. A marshal failure logs
+  `"!ERROR:<err>"` in place of the event; a panic in the event's marshal method is
+  recovered and logged as `"!ERROR:panic: <value>"`.
+
+> **Changed after implementation.** `Options.LogEvent` is a **`*bool`**, not a `bool`:
+> nil means the environment variable decides, and `new(true)` or `new(false)` wins over
+> it. A plain `bool` could only switch event logging on, never switch a truthy variable
+> off, and every other option backed by an environment variable was already a tri-state
+> `*bool`.
+
+- Correlation ID extraction order: `Options.CorrelationIDFunc` (typed, no cost) >
+  `Options.CorrelationIDPath` evaluated by `internal/jsonpath` > none. Both run in `begin`,
+  before the handler.
+
+> **Changed after implementation.** (1) A **string, number or boolean** found at the path
+> becomes the ID (strings unquoted, numbers and booleans as their literal text, always an
+> owned copy); `null`, objects and arrays give none. Event sources such as EventBridge
+> detail fields often carry numeric IDs. (2) A malformed path is reported once at `WARN`
+> when the wrapper is built and disables the extraction, instead of failing every
+> invocation. (3) A panic in `CorrelationIDFunc` is not recovered: it runs in `begin`,
+> before the wrapper's deferred recover, and a consumer bug there should crash loudly.
+
+What each wrapper shape gives the two extraction options and the event line:
+
+| Wrapper | `CorrelationIDFunc(ctx, event any)` gets | `CorrelationIDPath` runs on | `LogEvent` writes |
+| --- | --- | --- | --- |
+| `WrapHandler` | the raw payload as `jsontext.Value`, valid only during the call | the raw payload bytes, no copy | the raw payload as `jsontext.Value` |
+| `Wrap[In, Out]` | the typed `In` value (no cost) | a marshalled copy of `In` (cost documented) | the marshalled `In` |
+
+Built-in paths are string constants in package `logger`. `API_GATEWAY_REST` and
+`API_GATEWAY_HTTP` share a path; both names exist for parity with upstream.
+
+| Go identifier | Upstream name | Path |
+| --- | --- | --- |
+| `CorrelationPathAPIGatewayREST` | `API_GATEWAY_REST` | `requestContext.requestId` |
+| `CorrelationPathAPIGatewayHTTP` | `API_GATEWAY_HTTP` | `requestContext.requestId` |
+| `CorrelationPathAppSyncAuthorizer` | `APPSYNC_AUTHORIZER` | `requestContext.requestId` |
+| `CorrelationPathAppSyncResolver` | `APPSYNC_RESOLVER` | `request.headers."x-amzn-trace-id"` |
+| `CorrelationPathApplicationLoadBalancer` | `APPLICATION_LOAD_BALANCER` | `headers."x-amzn-trace-id"` |
+| `CorrelationPathEventBridge` | `EVENT_BRIDGE` | `id` |
+| `CorrelationPathLambdaFunctionURL` | `LAMBDA_FUNCTION_URL` | `requestContext.requestId` |
+| `CorrelationPathS3ObjectLambda` | `S3_OBJECT_LAMBDA` | `xAmzRequestId` |
+| `CorrelationPathVPCLattice` | `VPC_LATTICE` | `headers."x-amzn-trace-id"` |
 
 `internal/jsonpath` supports dot-separated keys with optional double-quoted segments for
 keys containing `-` or `.`; it is not JMESPath. `go-jmespath` is archived and is not a
@@ -311,66 +530,184 @@ dependency.
 
 ## 9. Buffering
 
-Per-invocation buffer stored in `State.LogBuffer` (type `invocation.LogBuffer`: a mutex, a byte budget and a slice of rendered records), allocated on first use.
+Per-invocation buffer stored in `State.LogBuffer` (type `invocation.LogBuffer`: its own
+mutex, a byte budget, the destination writer and a slice of rendered records), allocated
+on first use.
 
-- Records with level ≤ `BufferAtLevel` are buffered (rendered bytes, not `slog.Record`,
-  so timestamps are preserved and no record state escapes).
-- `MaxBytes` enforced; when full, the oldest records are dropped and a warning is
-  emitted on flush ("buffer dropped N records").
-- A single record larger than `MaxBytes` is written directly with a warning.
-- `FlushOnErrorLog`: any record at `ERROR` or above flushes the buffer **before** the
-  error line is written.
+> **Changed after implementation: ownership.** The first Powertools handler that buffers
+> a record in an invocation allocates the buffer and stores in it **its own writer and
+> `MaxBytes`**. `FlushBuffer(ctx)`, the wrapper's flush in `end` and the pre-timeout flush
+> all write to that stored writer, so none of them needs the handler, and a composed
+> handler (`MultiHandler`) works too. Documented limitation: handlers with different
+> writers or budgets that both buffer in one invocation share the first one's buffer. The
+> buffer's mutex is not the invocation mutex; lock order is buffer, then invocation, then
+> writer.
+
+- Only records that pass `Enabled` reach the buffer: buffering never widens the level.
+  With the default level `INFO` and the default `BufferAtLevel` `DEBUG`, nothing is
+  buffered unless the invocation is debug-sampled; to buffer debug lines, configure
+  `Level: slog.LevelDebug`. Python and TypeScript buffer records *below* the logger level;
+  this is a recorded parity gap (§13), chosen because `Enabled` must stay a cheap level
+  check with no buffer lookup.
+- Records with level ≤ `BufferAtLevel.Level()` (read per record) are buffered (rendered
+  bytes, not `slog.Record`, so timestamps are preserved and no record state escapes).
+- `MaxBytes` enforced; when full, the oldest records are dropped. On a flush, one `WARN`
+  line ("buffer dropped N records") is written **first**, then the surviving records in
+  order. The whole flush, notice included, runs under the buffer's mutex, so concurrent
+  flushes (pre-timeout timer, flush on error, `end`) write everything or nothing, never an
+  interleaving. The notice is rendered by a callback that never goes through a foreign
+  `slog.Handler`, which could re-enter the buffer and deadlock.
+- A single record larger than `MaxBytes` is written directly to the handler's writer,
+  followed by one `WARN` naming the record size and the budget.
+- `FlushOnErrorLog` (nil means true): any record at `ERROR` or above flushes the buffer
+  **before** the error line is written, so the error appears after its context. While it
+  is on, records at `ERROR` or above are never buffered, whatever `BufferAtLevel` says.
 - `FlushBufferOnUncaughtError` (wrapper option): flush in `end` when `err != nil` or the
   handler panicked.
 - After `end()` (`State.Closed`), records from late goroutines are written immediately,
-  never buffered, still carrying the old invocation's keys (01 §7.4). The opt-in
+  never buffered, still carrying the old invocation's keys (01 §7.4), and an `ERROR`
+  record flushes nothing: leftovers of a finished invocation stay discarded. The opt-in
   pre-timeout flush (`DeadlineMargin`) flushes the buffer before the deadline (01 §7 D6).
 - Not buffered: records emitted outside an invocation (`State == nil`) and records during
   a cold start (upstream behaviour, keeps init diagnostics visible).
 - Buffered bytes are written with one `Write` per record to keep line atomicity.
 
+> **Known limitation, found in implementation.** A record logged by a goroutine
+> concurrently with `end` can pass the `Closed` check, land in the buffer after `end`'s
+> last flush, and is then never written. Adding a closed state to the buffer and a
+> re-check followed by a direct write could duplicate a line a concurrent flush already
+> wrote. It matters only with `FlushBufferOnUncaughtError` and a failing handler; the
+> remedy is to wait for the invocation's goroutines before returning (01 §7.5).
+
 ```mermaid
 stateDiagram-v2
   [*] --> Empty: begin()
-  Empty --> Buffering: record at or below BufferAtLevel
+  Empty --> Buffering: enabled record at or below BufferAtLevel (first buffering handler allocates LogBuffer with its writer and MaxBytes)
   Buffering --> Buffering: more records (drop oldest when over MaxBytes)
   Buffering --> Flushed: ERROR or above logged (FlushOnErrorLog)
   Buffering --> Flushed: logger.FlushBuffer(ctx)
   Buffering --> Flushed: handler error or panic (FlushBufferOnUncaughtError)
   Buffering --> Discarded: logger.ClearBuffer(ctx)
   Buffering --> Discarded: end() without flush
-  Flushed --> [*]: records written in order, warning if any were dropped
+  Flushed --> [*]: dropped-records warning first if any were dropped, then the records in order, to the stored writer
   Discarded --> [*]
   note right of Buffering
-    Cold-start invocations and records
-    outside an invocation are never buffered.
+    Cold-start invocations, records outside
+    an invocation and records after end()
+    are never buffered.
   end note
 ```
 
 ## 10. Lambda ALC interplay
 
-- `AWS_LAMBDA_LOG_LEVEL` wins over everything (01 §3) and a one-time warning is logged
-  when the Powertools level is more verbose.
+- `AWS_LAMBDA_LOG_LEVEL` wins over everything (01 §3). A one-time warning ("current log
+  level is lower than ALC, lines below X will be discarded") is written at construction
+  when the Powertools level is more verbose than the ALC level.
 - Level strings and timestamps satisfy R5 so Lambda never re-levels our lines.
 - `AWS_LAMBDA_LOG_FORMAT=TEXT` with our JSON output is fine: Lambda forwards the line as is.
+
+> **Changed after implementation.** The ALC warning is written **only when a Powertools
+> level was explicitly configured** (`Options.Level` or a valid `POWERTOOLS_LOG_LEVEL`)
+> and is more verbose than the ALC level. The default `INFO` alone never warns: otherwise
+> every function deployed with ALC at `WARN` would print a warning on every cold start for
+> a choice nobody made. The warning is written at `WARN` even when the effective level
+> filters `WARN` (except under `LevelSilent`); Lambda itself may drop it under ALC `ERROR`
+> or `FATAL`.
 
 ## 11. Testing
 
 - `testing/slogtest.Run` conformance (groups, empty attrs, zero time, `LogValuer`).
-- Golden tests decode the line with `encoding/json/v2` into `map[string]any` and compare
+  The result function decodes each line with `encoding/json/v2` using
+  `jsontext.AllowDuplicateNames(true)` and `jsontext.AllowInvalidUTF8(true)`, then renames
+  `message` to `msg`, `timestamp` to `time` and `location` to `source`, because `slogtest`
+  checks the standard key names. The cases that drove the handler structure (§5) are
+  `multi-With`, `empty-group-record`, `nested-empty-group-record`, zero time, empty PC,
+  empty attr and inline group. A second run executes the same suite with an invocation
+  state in the context, so the Lambda keys never break conformance.
+- Golden tests decode the line with the same options into `map[string]any` and compare
   with `cmp.Diff` (semantic comparison, per the style guide), plus a key-order test on
-  the raw prefix for the fixed standard keys.
-- Table tests for level parsing, precedence with ALC, sampling boundaries (`0`, `1`,
-  `0.5` with a seeded `rand.Rand` injected through an unexported field in tests).
-- Buffer tests: overflow, oversize record, flush on error, flush on uncaught error,
+  the raw prefix for the fixed standard keys and a test that Lambda and invocation keys
+  stay at the top level under `WithGroup`. Golden files put a placeholder in place of the
+  `location` line number, so editing the test file does not change the golden data.
+- Parity fixtures: example log lines copied from the upstream TypeScript documentation,
+  with a provenance file (source page, commit, retrieval date, license) next to them. The
+  test logs the same inputs and checks that the key set and the JSON type of every
+  top-level key match; values are ignored except `level`, `message` and `service`.
+  Upstream examples that are internally inconsistent (`sampling_rate` as a string in one
+  sample and a number in another) or differ by design (Python-style timestamps, the
+  TypeScript error object with `stack`) are listed in the provenance file as not used.
+  Python output is not a fixture source because its default timestamp is not RFC 3339.
+- Location test: `logger.Info(ctx, ...)` and the other package functions report the
+  caller's function and line, not the logger package.
+- Duplicate keys, `ReplaceAttr` scope (it never sees built-in, Lambda or `AppendKeys`
+  keys; two handlers with different `ReplaceAttr` share the caches correctly) and the
+  `KindAny` fallback (`time.Duration` in a struct, an error nested in a map, invalid UTF-8,
+  a `chan` field each render `"!ERROR:..."` and the rest of the line is intact).
+- Table tests for level parsing, precedence with ALC, invalid environment levels, the ALC
+  warning (configured versus default level), `Enabled` with the sampled flag set directly
+  on the invocation state, and `LevelSilent` with a sampled invocation (nothing is
+  enabled). The dice roll itself lives in the wrapper: rates `0` and `1` are tested end to
+  end, and the `0.5` boundary with a seeded `rand.Rand` injected through an unexported
+  field.
+- Buffer tests: overflow, oversize record, flush on error, `FlushOnErrorLog` nil versus
+  false, `BufferAtLevel` nil versus an explicit level or `*slog.LevelVar`, flush on
+  uncaught error, `FlushBuffer` writing to the stored writer (also behind a
+  `MultiHandler`), two handlers with different writers sharing the first buffer,
   concurrent `AppendKeys` from goroutines under `-race`.
-- `AllocsPerRun` tests for `Info` with 0, 3 and 10 scalar attrs and for a disabled level.
+- Allocation budgets with `testing.AllocsPerRun`, in files excluded from `-race` builds
+  (the race detector makes `sync.Pool` drop items) and run in a separate non-race step.
+  Every value is non-constant (returned from a `//go:noinline` helper), so the tests
+  cannot pass on constant-folded args.
+
+| Call | Budget (allocs per record) | Measured by the reference implementation |
+| --- | --- | --- |
+| `LogAttrs` with 0, 3 and 5 scalar attrs, enabled, with or without the wrapper | 0 | 0 |
+| `LogAttrs` with 5 scalar attrs, disabled | 0 | 0 |
+| `LogAttrs` with 10 scalar attrs, enabled | 1 (`slog.Record` stores 5 attrs inline) | 1 |
+| `Info` or `logger.Info` with no args, disabled | 0 | 0 |
+| `Info` or `logger.Info` with 3 non-constant key-value args | one per boxed value at the call site (3) | 2 (a small `int64` is boxed without allocating) |
+| `Info` with one `slog.Any(struct)` | 3 | 3 |
+| `AppendKeys(ctx, 1 attr)` | 1 | 0, and the next record 0 |
+
+> **Changed after implementation.** The plan's "`AllocsPerRun` for `Info` with 0, 3 and
+> 10 scalar attrs" was too optimistic for key-value args: `...any` boxing happens at the
+> call site, outside the handler's control. The budgets therefore gate `LogAttrs`, and
+> key-value args are documented at one allocation per boxed value.
 
 ## 12. Performance targets
 
-Measured in 05-performance.md; targets after baseline: 0 allocations per enabled record
-with scalar attrs (pooled buffer, no escapes), 0 allocations for a disabled level, under
-1 µs per record excluding the `Write` syscall.
+Measured in 05-performance.md; targets after baseline:
+
+- 0 allocations per enabled or disabled record through `LogAttrs` with up to 5 scalar
+  attrs (pooled buffer, no escapes); 1 allocation with 10 attrs (the `slog.Record`
+  overflow slice, outside the handler).
+- 0 allocations for a disabled level with no args.
+- Key-value args cost one boxing allocation per non-constant value at the call site,
+  before `Enabled`; `LogAttrs` is recommended on hot paths.
+- Under 1 µs per record excluding the `Write` syscall.
+
+> **Validated in implementation.** A reference implementation measured, with Go 1.27 on
+> an arm64 developer laptop (medians of 10 runs, writer `io.Discard`; Lambda on Graviton
+> will differ in absolute time, not in allocations):
+>
+> | Benchmark | ns/op | allocs/op |
+> | --- | ---: | ---: |
+> | disabled level, no args | 4.3 | 0 |
+> | `LogAttrs`, 5 scalar attrs, disabled | 5.5 | 0 |
+> | `LogAttrs`, 5 scalar attrs, enabled, no wrapper | 384 | 0 |
+> | `LogAttrs`, 5 scalar attrs, enabled, wrapper keys present | 420 | 0 |
+> | `slog.JSONHandler`, same record (baseline) | 443 | 0 |
+> | `LogAttrs`, 10 scalar attrs | 602 | 1 |
+> | key-value args, 3 non-constant values | 381 | 2 |
+> | one `slog.Any(struct)` | 623 | 3 |
+> | buffered `DEBUG` record | 452 | 1 |
+> | `AppendKeys`, 1 attr | 25 | 0 |
+>
+> So the handler runs at 0.87x of `slog.JSONHandler` without the wrapper and 0.95x with
+> it, while writing the Lambda keys the standard handler does not (targets: within 1.2x
+> and 1.5x). The per-record target of 1 µs is met with margin. The `Handler` struct is
+> 128 bytes; the per-invocation buffer header is 72 bytes, allocated on the first
+> buffered record only.
 
 ## 13. Parity matrix
 
@@ -379,15 +716,113 @@ with scalar attrs (pooled buffer, no escapes), 0 allocations for a disabled leve
 | Standard keys | yes | yes | yes, TypeScript timestamp layout |
 | Levels | DEBUG…CRITICAL | TRACE…CRITICAL, SILENT | TRACE…FATAL (Lambda names); `CRITICAL`, `WARNING`, `SILENT` accepted on input |
 | Lambda context keys | yes | yes | yes, via wrapper |
-| `log_event` | yes | yes | yes |
-| Correlation ID path | JMESPath | JMESPath | dot path + typed func |
+| `log_event` | yes | yes | yes, raw payload as `jsontext.Value` under `WrapHandler`; `LogEvent` is a `*bool` |
+| Correlation ID path | JMESPath | JMESPath | dot path + typed func; string, number or boolean values |
 | `append_keys` / `remove_keys` / `clear_state` | process-scoped | instance-scoped | invocation-scoped |
 | Persistent keys | yes | yes | `Options.PersistentAttrs`, `With` |
 | Child loggers | yes | `createChild` | `log.With`, `slog.New(handler.WithAttrs(...))` |
-| Sampling | yes | yes | yes |
+| Sampling | yes | yes | yes, with the wrapper only |
 | Buffering | yes | yes | yes |
-| Custom formatter | subclass | subclass | `ReplaceAttr`, or wrap/compose the handler |
+| Buffering below the logger level | yes | yes | no: records must pass the level; set `Level` DEBUG to buffer debug lines |
+| Custom formatter | subclass | subclass | `ReplaceAttr` (consumer attrs only), or wrap/compose the handler |
 | `logRecordOrder` | yes | yes | no (fixed standard order, then attrs); v1.1 candidate |
 | Exception / stack serialisation | traceback | `stack` | `name`, `message`, `cause`; stack in v1.1 |
-| `POWERTOOLS_DEV` pretty print | yes | yes | yes |
+| `POWERTOOLS_DEV` pretty print | yes | yes | yes, ignored inside Lambda |
+| Reserved-key warning | n/a | once per process | once per handler family |
 | Thread-safe keys | `thread_safe_append_keys` | n/a | all keys are goroutine-safe |
+
+## 14. Usage examples (intended API)
+
+These snippets are examples of the intended API, checked against the exported signatures
+of the reference implementation. Import paths are omitted; `logger`, `metrics` and
+`powertools` stand for the logger package, the metrics package and the root wrapper
+package; `Order`, `Receipt`, `charge` and `suspicious` are placeholders of the consumer's
+code.
+
+Construct once, in `main` or at package init:
+
+```go
+log := logger.New(logger.Options{
+    Service:         "payment",                               // else POWERTOOLS_SERVICE_NAME
+    Level:           slog.LevelDebug,                         // else POWERTOOLS_LOG_LEVEL; ALC wins
+    PersistentAttrs: []slog.Attr{slog.String("env", "prod")}, // on every line
+    AddSource:       true,                                    // "location": "main.handle:42"
+    Buffer: logger.BufferOptions{
+        Enabled: true, // DEBUG lines wait in the invocation buffer
+        // BufferAtLevel nil ⇒ DEBUG; FlushOnErrorLog nil ⇒ true
+    },
+})
+
+lambda.Start(powertools.Wrap(handle, powertools.Options{
+    Logger:                     log,
+    LogEvent:                   new(true), // nil ⇒ POWERTOOLS_LOGGER_LOG_EVENT
+    CorrelationIDPath:          logger.CorrelationPathAPIGatewayREST,
+    FlushBufferOnUncaughtError: true,
+}))
+```
+
+Inside the handler, only `ctx` is needed:
+
+```go
+func handle(ctx context.Context, in Order) (Receipt, error) {
+    // Visible on every later line of this invocation, from any goroutine holding ctx.
+    logger.AppendKeys(ctx, slog.String("order_id", in.ID))
+    defer logger.RemoveKeys(ctx, "order_id") // optional: state is per invocation anyway
+
+    logger.Info(ctx, "collecting payment")                    // location names this line
+    logger.Debug(ctx, "cart loaded", "items", len(in.Items)) // buffered, not yet written
+
+    // Hot path: typed attrs, no boxing, 0 allocations for up to five scalars.
+    logger.FromContext(ctx).LogAttrs(ctx, slog.LevelInfo, "pricing",
+        slog.Float64("total", in.Total),
+        slog.Int("items", len(in.Items)),
+    )
+
+    if err := charge(ctx, in); err != nil {
+        // Flushes the buffered DEBUG lines first, then writes this line.
+        logger.Error(ctx, "charge failed", slog.Any("error", err))
+
+        return Receipt{}, err
+    }
+
+    return Receipt{OrderID: in.ID}, nil
+}
+```
+
+Correlation IDs and the buffer, by hand:
+
+```go
+// Override what the wrapper extracted (or set one when no path is configured).
+logger.SetCorrelationID(ctx, requestID)
+id := logger.CorrelationID(ctx) // "" when unset or outside an invocation
+
+if suspicious {
+    logger.FlushBuffer(ctx) // write the buffered lines now, in order, then clear
+} else {
+    logger.ClearBuffer(ctx) // drop them
+}
+```
+
+Composition, redaction and level parsing:
+
+```go
+h := logger.NewHandler(logger.Options{
+    Service: "payment",
+    ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+        if a.Key == "card" {
+            return slog.String("card", "REDACTED") // consumer attrs only
+        }
+
+        return a
+    },
+})
+
+// Powertools JSON to stdout, plain text to stderr for a local tail.
+log := slog.New(slog.NewMultiHandler(h, slog.NewTextHandler(os.Stderr, nil)))
+
+lvl, err := logger.ParseLevel("critical") // logger.LevelFatal, nil
+if errors.Is(err, logger.ErrInvalidLevel) {
+    // unknown name
+}
+_ = logger.LevelName(lvl) // "FATAL"
+```
