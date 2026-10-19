@@ -1,12 +1,13 @@
 # 01. Architecture
 
-> **How to read the implementation notes.** A reference implementation of this plan was
-> built and released as v1.0.0. Where it confirmed the plan, a short **Validated in
-> implementation** note says so; where it forced a change, a **Changed after
-> implementation** note gives the new rule and the reason. Decision numbers up to 25 are
-> the reviewer decisions of the original plan; 26 to 44 were taken while implementing it
-> (09). The text below is still a plan: it says what the library does and why, not how a
-> particular code base is organised.
+This file fixes the rules every package follows: the runtime facts the design depends
+on (§1), how the module is laid out and what it may import (§2), how configuration is
+resolved (§3), how one invocation's state travels through `context.Context` and how the
+wrapper drives the utilities (§4), the concurrency model (§5), the error and panic policy
+(§6), and what happens at deadlines, freeze and shutdown (§7). Rules are numbered (R1 to
+R11, F1 to F6, D1 to D7) so the other files and the tests can cite them; decision numbers refer to
+the decision log ([09](09-open-questions.md)). Every Go snippet is an illustrative
+example of the intended API, not code to copy.
 
 ## 1. Runtime facts that constrain the design
 
@@ -27,19 +28,21 @@ that establishes it.
 | R10 | EMF: at most 100 metric definitions per log event, at most 30 dimension keys per set (Powertools uses 29), at most 100 values per metric array, `Timestamp` in epoch milliseconds within 14 days past / 2 hours future, numeric values within ±2^360, namespace and names 1 to 255 printable ASCII. | EMF specification, Powertools `cloudwatch.py` constants |
 | R11 | `aws-xray-sdk-go/v2` requires Go 1.26 and depends on `grpc`, `protobuf`, `fasthttp`, `aws-sdk-go-v2`, `route53`. The tracer wraps it (decision 3). Go links only imported packages, so a binary that imports neither `tracer` nor the root wrapper does not contain any of this; the SDK does appear in every consumer's module graph because the library is one module (decision 25). Only `tracer` imports the SDK **directly** in production code. The root wrapper reaches it transitively through `tracer` and never names an SDK type. Test files (`_test.go`) may import the SDK, because they are never linked into consumer binaries. CI checks both rules (06 §5). | `aws-xray-sdk-go` `go.mod` v2.0.4 |
 
-> **Changed after implementation.**
-> - **R1** (decision 35): the original rule also required `LAMBDA_TASK_ROOT`. Nothing
->   needed it, and a single variable is easier to reproduce in tests.
-> - **R2** (decision 30): the original plan read `_X_AMZN_TRACE_ID` as a fallback when
->   max concurrency is 1. The SDK never reads it, so a fallback could make the logger
->   print a trace ID that the tracer does not use. One source, one answer.
-> - **R8** (decision 29): the original plan let `WrapHandler` wrap
->   `lambda.NewHandler(fn)` and observe typed values through `handlertrace`. Reading
->   aws-lambda-go showed the pooled-buffer race above, so `WrapHandler` takes only
->   hand-written handlers that own their returned bytes, and `handlertrace` is not used
->   (§4.2).
-> - **R9 and R11** gained the datagram and transitive-import facts; both shaped the
->   tracer's metadata budget (04 §5) and the import checks (06 §5).
+What follows from the rules, and why:
+
+- **R1** (decision 35): one variable decides "in Lambda". Requiring a second one (such
+  as `LAMBDA_TASK_ROOT`) adds nothing and makes the condition harder to reproduce in
+  tests.
+- **R2** (decision 30): the X-Ray SDK never reads `_X_AMZN_TRACE_ID`, so reading it as a
+  fallback could make the logger print a trace ID that the tracer does not use. One
+  source, one answer, and it is correct at any concurrency.
+- **R8** (decision 29): because of the pooled-buffer race, `WrapHandler` takes only
+  hand-written handlers that own their returned bytes, and `lambda/handlertrace` (which
+  would expose typed values from inside `lambda.NewHandler`) is not used (§4.2).
+- **R9** shapes the tracer's per-invocation metadata budget (04 §5): the limit is the
+  size of one datagram, and response or error metadata is what makes a document large.
+- **R11** shapes the import checks (06 §5): a direct-import rule alone would miss a
+  utility that reaches the SDK through another package.
 
 ## 2. Module and package layout
 
@@ -48,13 +51,6 @@ versions every package; there is one `go.mod`, no `go.work`, no per-utility tags
 release script that rewrites `require` lines. Consumers import the packages they need
 (`.../logger`, `.../metrics`, `.../tracer`, or the root `powertools` wrapper) from the
 same module version.
-
-> **Validated in implementation.** One module was never a problem during the whole
-> build: the root wrapper and the three utilities changed together many times (the
-> shared `State` contract, the API freeze, the API review) without any version
-> juggling. Tags are best cut by a release tool from conventional commits (06 §6),
-> with v0 minor releases while the API settles and one v1.0.0 after an API review
-> (08 §3); after v1.0.0 a breaking change needs a `/v2` module path.
 
 | Package | Imports | Linked into a binary when |
 | --- | --- | --- |
@@ -75,9 +71,15 @@ libraries.
   `internal/invocation.State` contract. In one module there is nothing to mismatch: a
   consumer at `v0.3.0` has the `v0.3.0` of every package. Powertools Python ships the
   same way.
-- **Standard mechanics only.** Tagging is `git tag vX.Y.Z` (done by the release tool);
-  `go get …/powertools-lambda-go@vX.Y.Z` brings every package; `internal/` is the
-  ordinary Go visibility rule, nothing clever.
+- **It absorbs change.** The root wrapper and the three utilities change together
+  whenever the shared `State` contract moves, during the API freeze and during the API
+  review. In one module such a change is one commit and one release, with no version
+  juggling between packages.
+- **Standard mechanics only.** Tagging is `git tag vX.Y.Z`, done by a release tool from
+  conventional commits (06 §6, decisions 27 and 34): v0 minor releases while the API
+  settles, one v1 after the API review (08 §3), and after v1 a breaking change needs a
+  `/v2` module path (decision 40). `go get …/powertools-lambda-go@vX.Y.Z` brings every
+  package; `internal/` is the ordinary Go visibility rule, nothing clever.
 - **The accepted cost.** The X-Ray SDK is a requirement of the module, so it appears in
   every consumer's module graph (`go.sum` entries, Dependabot alerts for logger-only
   users). It does **not** reach their binaries unless they import `tracer` or the
@@ -94,17 +96,27 @@ libraries.
   dependency that must stay optional), a package can be split into its own module at a
   major version boundary. The decision log records why it is not done now.
 
-> **Measured in implementation.** A reference implementation built every example for
-> `linux/arm64` with `-tags lambda.norpc -trimpath -ldflags='-s -w'`. A bare
-> `lambda.Start` binary was about 6.0 MiB; adding `logger` and `metrics` without the
-> wrapper added about 128 KiB; using `Wrap` with all three utilities added about
-> 5.4 MiB (the X-Ray SDK and its tree, linked through `tracer` even when tracing is
-> off); a full example that also used the AWS SDK for Go v2 with one service client
-> added about 9.5 MiB. A size-sensitive function therefore uses `logger` and `metrics`
-> without the wrapper. A CI size job that builds a bare baseline and the logger-only
-> example in the same run, and fails when the difference exceeds a budget (1 MiB was
-> used) or when `go version -m` shows the SDK in the logger-only binary, kept this
-> property honest.
+### Binary size targets and the size gate
+
+Lambda binaries are built with `CGO_ENABLED=0 go build -tags lambda.norpc -trimpath
+-ldflags='-s -w'` for `provided.al2023`. Against a bare binary that only calls
+`lambda.Start`, expect these orders of magnitude:
+
+| Binary | Expected addition over the bare binary | Why |
+| --- | --- | --- |
+| `logger` and `metrics`, no wrapper | on the order of a hundred KiB | standard library code already linked by `aws-lambda-go`, plus the two packages |
+| `Wrap` with all three utilities | several MiB (around 5) | the X-Ray SDK and its tree, linked through `tracer` even when tracing is off |
+| the above plus the AWS SDK for Go v2 and one service client | several MiB more | the AWS SDK itself, a consumer choice |
+
+A size-sensitive function therefore uses `logger` and `metrics` without the wrapper.
+The CI size job keeps that property true (decision 37): it builds `examples/bare` and
+`examples/hello` (logger and metrics, no wrapper) in the same run, with the same flags
+and toolchain, and fails when the difference exceeds 1 MiB or when `go version -m`
+lists the X-Ray SDK in the `hello` binary. Comparing two binaries of one run makes the
+gate independent of the toolchain and the runner; an absolute size threshold would not
+be.
+
+What each kind of binary links, against what every consumer's module graph contains:
 
 ```mermaid
 flowchart TB
@@ -123,65 +135,68 @@ flowchart TB
   class b3 heavy;
 ```
 
-### Dependency pitfalls found during implementation
+### Dependency pitfalls to plan for
 
-> **Changed after implementation** (decision 35). Two `go.mod` surprises appeared the
-> day the SDK was added; both are worth planning for:
->
-> - **`github.com/aws/smithy-go` becomes a direct require.** `tracer.InstrumentAWS`
->   takes `*[]func(*middleware.Stack) error`, the type of `aws.Config.APIOptions`, so
->   `tracer` imports `smithy-go/middleware`. The module was already in the SDK's graph,
->   so the graph gains nothing, but `go mod tidy` moves it to the direct block.
-> - **The SDK's pinned `golang.org/x/net` failed `govulncheck`.** The version the SDK
->   required carried HTTP/2 advisories that `govulncheck` reported as reachable through
->   the library's own packages, so a blocking
->   `govulncheck` job fails on the first commit that adds the SDK. The fix is an explicit
->   higher `golang.org/x/net` requirement in the library's `go.mod` (which also moves
->   `x/sys` and `x/text`), removed again once an SDK release requires a fixed version.
->   Plan a `govulncheck` run in the same change that adds the SDK.
->
-> Two more rules kept the module graph calm: `govulncheck` covers the library module
-> only, and the untagged `examples/` module is left to Dependabot, so an AWS SDK
-> advisory in an example never blocks an unrelated library change (decision 37).
+Decision 35. Adding the X-Ray SDK to `go.mod` has two consequences that belong in the
+same change:
+
+- **`github.com/aws/smithy-go` becomes a direct requirement.** `tracer.InstrumentAWS`
+  takes `*[]func(*middleware.Stack) error`, the type of `aws.Config.APIOptions`, so
+  `tracer` imports `smithy-go/middleware`. The module is already in the SDK's graph, so
+  the graph gains nothing, but `go mod tidy` moves it to the direct block.
+- **The SDK's pinned transitive dependencies can fail `govulncheck`.** The
+  `golang.org/x/net` version an SDK release requires may carry HTTP/2 advisories that
+  `govulncheck` reports as reachable through the library's own packages, and a blocking
+  `govulncheck` job then fails on the commit that adds the SDK. The remedy is an
+  explicit higher `golang.org/x/net` requirement in the library's `go.mod` (which may
+  also move `x/sys` and `x/text`), removed again once an SDK release requires a fixed
+  version. Run `govulncheck` in the change that adds the SDK, not after it.
+
+Two more rules keep the module graph calm (decision 37): `govulncheck` covers the
+library module only, and the untagged `examples/` module is left to Dependabot, so an
+AWS SDK advisory in an example never blocks an unrelated library change.
 
 ### Test layout and build tags
 
-> **Changed after implementation** (decisions 26, 28, 37, 38). The plan did not say
-> where tests live or how they are selected. What worked:
->
-> - Every unit test file carries `//go:build unit`, and every tool is told about it
->   (`go test -tags=unit`, `go vet -tags=unit`, `go fix -tags=unit`, the linter's
->   `build-tags`). A tool that is not told silently sees no tests.
-> - Two exceptions. The deployed-example harness carries `//go:build integration`, and
->   is proved to skip cleanly when its environment variables are unset. The
->   `example_test.go` files carry **no** tag, because `go doc -ex` does not list examples
->   from tagged files and has no `-tags` flag. A plain, untagged `go vet` over the public
->   packages then proves the examples compile on their own, so an example never depends
->   on a helper defined in a tagged test file.
-> - Allocation budget tests additionally carry `!race` (`//go:build unit && !race`):
->   the race detector makes `sync.Pool` drop items, so allocation counts are only
->   meaningful in a separate non-race run (05 §6).
-> - The root package's wrapper tests are split per utility (one test file each for the
->   logger, metrics and tracer interaction, all in the external test package), so the
->   three utility phases never edit the same file and can merge in parallel (07).
->   The tracer wrapper test may import the SDK, for example to point
->   `xray.ContextWithConfig` at a per-test UDP listener, because the import rule covers
->   production code only (R11).
-> - Shared test helpers (the SA1029 trace-header helper of R2, fixtures) live in an
->   internal test-support package that only test files import, so every lint exemption
->   exists exactly once.
+Decisions 26, 28, 37 and 38. Where tests live and how they are selected:
+
+- **Every unit test file carries `//go:build unit`**, and every tool is told about it
+  (`go test -tags=unit`, `go vet -tags=unit`, `go fix -tags=unit`, the linter's
+  `build-tags`). Pitfall: a tool that is not told silently sees no tests and reports
+  success.
+- **Two exceptions.** The deployed-example harness carries `//go:build integration` and
+  must skip cleanly, with a message, when its environment variables are unset; a test
+  proves it. The `example_test.go` files carry **no** tag, because `go doc -ex` does not
+  list examples from tagged files and has no `-tags` flag. A plain, untagged `go vet`
+  over the public packages then proves the examples compile on their own, so an example
+  never depends on a helper defined in a tagged test file.
+- **Allocation budget tests additionally carry `!race`** (`//go:build unit && !race`):
+  the race detector makes `sync.Pool` drop items, so allocation counts are only
+  meaningful in a separate non-race run (05 §6).
+- **The root package's wrapper tests are split per utility** (one test file each for the
+  logger, metrics and tracer interaction, all in the external test package), so the
+  three utility phases never edit the same file and can merge in parallel (07). The
+  tracer wrapper test may import the SDK, for example to point `xray.ContextWithConfig`
+  at a per-test UDP listener, because the import rule covers production code only (R11).
+- **Shared test helpers** (the SA1029 trace-header helper of R2, fixtures) live in
+  `internal/testsupport`, which only test files import, so every lint exemption exists
+  exactly once.
 
 ### Go version floor
 
-Decision 1: the module declares `go 1.27.0` (and so does `examples/go.mod`). `encoding/json/v2` and
-`encoding/json/jsontext` (GA in 1.27) back `internal/jsonenc`: `jsontext.AppendQuote`
-for strings, `json.MarshalWrite` for arbitrary values, with no hand-rolled escaping.
+Decision 1: the module declares `go 1.27.0` (and so does `examples/go.mod`).
+`encoding/json/v2` and `encoding/json/jsontext` (GA in 1.27) back `internal/jsonenc`:
+`jsontext.AppendQuote` for strings, `json.MarshalWrite` for arbitrary values, with no
+hand-rolled escaping.
 
-> **Validated in implementation.** Pin the patch toolchain with a `toolchain go1.27.N`
-> line and let required CI jobs read `go-version-file: go.mod`; run Go tip in a
-> non-required nightly job. `go test` runs the `stdversion` vet check, so a standard
-> library symbol newer than the `go` directive fails the tests, and tools built with an
-> older Go fail on 1.27 sources: re-install them after every toolchain bump.
+- Pin the patch toolchain with a `toolchain go1.27.N` line, and let required CI jobs
+  read `go-version-file: go.mod`, so local builds and CI use the same compiler. Go tip is
+  not a CI job (decision 1): the dependency-update pull request that bumps the toolchain
+  line runs every gate on the new compiler.
+- `go test` runs the `stdversion` vet check: a standard library symbol newer than the
+  `go` directive fails the tests. This is the guard that keeps the floor honest.
+- Go tools (linters, `betteralign`, `govulncheck`) built with an older Go fail on 1.27
+  sources: re-install them after every toolchain bump.
 
 ### JSON policy (decision 23)
 
@@ -214,11 +229,10 @@ repository. Consequences:
   values, not bytes.
 - `GOEXPERIMENT=nojsonv2` builds are unsupported and the CI matrix does not include them.
 
-> **Changed after implementation** (decisions 32, 33). The original text expected a
-> `jsontext.Value` to reach the SDK "verbatim" and kept `json.RawMessage` as a fallback.
-> A recorded segment showed the v1 re-validation and HTML escaping above, which matters
-> for the 64 kB datagram limit (R9). The marshal-failure rules per utility were added
-> because the plan did not say what happens when a consumer value cannot be encoded.
+Pitfall: do not assume raw JSON reaches the X-Ray SDK verbatim. Size every metadata
+value as the SDK will write it (escaped), because the document must fit one datagram
+(R9). Acceptance: a tracer test records a segment whose metadata contains `<`, `>` and
+`&`, and checks both the decoded value and the budget arithmetic (04 §5).
 
 ### Package responsibilities (single responsibility per package)
 
@@ -237,11 +251,10 @@ repository. Consequences:
 | `metrics` | EMF batching, validation, serialization, cold-start metric (`EmitColdStart`) and single metrics | see 03 |
 | `tracer` | Powertools semantics over `aws-xray-sdk-go/v2`: enable rules, handler segment and its end-of-handler helper, `Capture` helpers, nil-safe context helpers (`AddAnnotation`, `AddMetadata`), `HTTPClient` and `InstrumentAWS`, the per-invocation metadata budget | see 04 |
 
-> **Changed after implementation** (decision 33). A separate `internal/env` package was
-> folded into `internal/lambdaenv`, so exactly one package reads the environment.
-> `internal/jsonpath`, `internal/benchutil` and `internal/testsupport` joined the
-> layout. `internal/invocation` exposes locked methods instead of letting the logger
-> take `State.Mu` itself, which kept the lock order in one place (§5).
+Two layout rules with their reasons (decision 33): exactly one package,
+`internal/lambdaenv`, reads the environment, so precedence and truthy parsing are
+written and tested once; and `internal/invocation` exposes locked methods instead of
+letting the logger take `State.Mu` itself, so the lock order of §5 lives in one place.
 
 ## 3. Configuration model
 
@@ -260,22 +273,29 @@ self-documenting, new fields never break call sites, and `context.Context` is ne
 of an option struct. Functional options are not used anywhere. Tri-state fields are
 `*bool` and are set with Go 1.26's `new(expr)`: `tracer.Options{CaptureResponse: new(false)}`.
 
-> **Changed after implementation** (decisions 33, 42). Two more rules keep the zero
-> value usable:
->
-> - **A boolean whose default is `true` is a `*bool`** (nil means true), for example
->   `logger.BufferOptions.FlushOnErrorLog`. A plain `bool` would make the zero value mean
->   "off" for a feature that should be on.
-> - **Every option backed by an environment variable is a `*bool`**, so the caller can
->   switch the variable off as well as on. `powertools.Options.LogEvent` started as a
->   `bool`, which could only switch event logging on; it became a `*bool` in the API
->   review. Likewise `logger.BufferOptions.BufferAtLevel` is a `slog.Leveler` whose nil
->   means DEBUG.
->
-> `metrics.New` is the only constructor that returns an error: an invalid namespace,
-> service or default dimension would make every later blob invalid, so it fails early,
-> whereas the logger falls back to its defaults with one warning and the tracer has
-> nothing that can fail (decisions 36, 44).
+Rules that keep the zero value usable (decisions 33, 42):
+
+- **A boolean whose default is `true` is a `*bool`** (nil means true), for example
+  `logger.BufferOptions.FlushOnErrorLog`. A plain `bool` would make the zero value mean
+  "off" for a feature that should be on.
+- **A boolean backed by an environment variable is a `*bool`**, so the caller can switch
+  the variable off as well as on: nil defers to the variable, `new(true)` and
+  `new(false)` win over it. `powertools.Options.LogEvent`, `metrics.Options.Disabled`,
+  `tracer.Options.Enabled`, `CaptureResponse` and `CaptureError`, and
+  `logger.Options.Pretty` follow it. A plain `bool` could only switch a feature on.
+- **Other "unset" values are the type's nil or zero**: `logger.Options.Level` and
+  `logger.BufferOptions.BufferAtLevel` are `slog.Leveler`s whose nil means "from the
+  environment" and DEBUG respectively; a numeric option at 0 or less means its default.
+- **Options are copied by the constructor.** Changing an Options value afterwards has no
+  effect on an instance already built.
+
+`metrics.New` is the only constructor that returns an error: an invalid namespace,
+service or default dimension would make every later blob invalid, so it fails early,
+whereas the logger falls back to its defaults with one warning and the tracer has
+nothing that can fail (decisions 36, 44). A namespace that is merely absent is not an
+error at `New`, because a function may emit only `Single` metrics that carry their own
+namespace (`WithNamespace`); every batch `Flush` then reports `ErrNamespaceMissing`
+(03 §2). A present but invalid namespace is a code bug and fails at `New`.
 
 Illustrative use of the intended API:
 
@@ -332,17 +352,21 @@ will be discarded") exactly as the Python and TypeScript editions do. When ALC i
 Environment is read **once, in the constructors** (`logger.NewHandler`, `metrics.New`,
 `tracer.New`, `powertools.Wrap` and `WrapHandler`), which cache what they need. Nothing
 reads `os.Getenv` per invocation; the trace header comes only from the invocation
-context (R2).
+context (R2). `tracer.HTTPClient` and `tracer.InstrumentAWS` are constructors in this
+sense too: they evaluate the enable rules when called, at init.
 
-> **Changed after implementation** (decision 35). The original plan took an
-> **environment snapshot at package init** in `internal/lambdaenv`. That made tests
-> order-dependent: `t.Setenv` runs after init, so a test could not change what the
-> library saw. The getters now read the environment when called, and only constructors
-> call them. Consequences an implementer should keep: tests set variables with
-> `t.Setenv` *before* constructing; a value read at construction never changes for that
-> instance; the only process-wide copy of environment values is aws-lambda-go's own
-> `lambdacontext` variables (R3). `tracer.HTTPClient` and `tracer.InstrumentAWS` are
-> constructors in this sense too: they evaluate the enable rules when called, at init.
+There is **no environment snapshot at package init** (decision 35). The getters of
+`internal/lambdaenv` read the environment when called, and only constructors call them.
+Reason: an init-time snapshot makes tests order-dependent, because `t.Setenv` runs after
+package init, so a test could not change what the library sees. Consequences:
+
+- Tests set variables with `t.Setenv` **before** constructing.
+- A value read at construction never changes for that instance; two instances built
+  under different environments behave differently, as intended.
+- The only process-wide copy of environment values is aws-lambda-go's own
+  `lambdacontext` variables (R3), which the library reads but never caches again.
+- Acceptance: a test constructs each utility twice under different `t.Setenv` values and
+  checks that each instance follows the environment of its construction.
 
 ### Environment variables honoured
 
@@ -373,9 +397,13 @@ context (R2).
 | `_X_AMZN_TRACE_ID` | none | | never read: the trace header comes only from `ctx` (R2) |
 | `TZ` | logger | `:UTC` | timestamps are UTC unless `Options.Location` is set |
 
-> **Changed after implementation.** `AWS_LAMBDA_MAX_CONCURRENCY` and `_X_AMZN_TRACE_ID`
-> were consumed by the original plan; both are now never read (decisions 30, 35).
-> `POWERTOOLS_LOGGER_LOG_EVENT` follows the `*bool` rule (decision 42).
+Truthy values are parsed in one place (`internal/lambdaenv`) with the same rule for
+every boolean variable (`AWS_XRAY_SDK_DISABLED` excepted, compared as the SDK compares
+it). A variable that is set but unparseable is treated as unset, and so is a NaN or
+infinite number, so the default applies; it never fails a constructor. The parser
+reports "unset" separately from "false", which the `POWERTOOLS_DEV` rule of metrics
+needs (an explicit `POWERTOOLS_METRICS_DISABLED=false` wins over dev mode). When this table changes, the
+environment-variable lists in 02, 03 and 04 and the package docs change with it.
 
 ## 4. Invocation lifecycle and context propagation
 
@@ -450,14 +478,28 @@ would forward it. This is an accepted divergence, because Lambda appends extra f
 such as `Lineage` last; a table test in `tracer` runs the same inputs through both
 parsers and checks that they agree on the three known fields.
 
-> **Changed after implementation** (decisions 30, 31, 33, 35). Compared with the
-> original struct: `Segment any` is gone (the handler segment is a local variable of the
-> wrapper, so root never names an SDK type); `OpenSegments atomic.Int32` is gone (the
-> SDK already knows whether a segment was emitted, §7 D7); `marginTimer` moved out of
-> `State` into a root-local struct; `MetadataBytes` was added for the per-invocation
-> metadata budget; `TraceHeader.Rest` was added so `tracer.Header` can forward fields
-> such as `Lineage`. The `LogBuffer` got its own mutex because a flush writes many
-> records and must not hold `State.Mu` while doing so.
+What `State` deliberately does **not** hold, and why (decisions 30, 31, 33, 35):
+
+- **No segment.** The handler segment is a local variable of the wrapper's closure, so
+  the root package never names an SDK type (R11) and `internal/invocation` stays free of
+  the SDK. The current segment travels only under the SDK's own context key.
+- **No open-subsegment counter.** The SDK already records whether a segment was emitted;
+  a counter in `State` would see only children opened through `tracer`, not those of
+  `xray.Client`, `awsv2` or direct SDK calls (§7 D7).
+- **No timer.** The `DeadlineMargin` timer lives in a root-local struct, so nothing in a
+  shared struct can outlive `end()` by accident.
+
+And why two fields exist: `MetadataBytes` carries the per-invocation metadata budget
+across the handler segment and every `Capture` child (04 §5); `TraceHeader.Rest` lets
+`tracer.Header` forward fields such as `Lineage` without re-parsing. The `LogBuffer` has
+its own mutex because a flush writes many records and must not hold `State.Mu` while
+doing so (§5 lock order).
+
+Acceptance for the parser: a table test feeds `ParseTraceHeader` and the SDK's
+`header.FromString` the same inputs (fields in any order, duplicates, `Self=`, fields
+without `=`, empty and whitespace-only values, `Sampled=?` and `Sampled=0`) and checks
+that both agree on `Root`, `Parent` and `Sampled`; an allocation test pins the parser at
+0 allocations.
 
 Design notes:
 
@@ -478,6 +520,11 @@ Design notes:
   segment, because all of that is reachable from `ctx`. Work that finishes after the
   handler returns is not part of the invocation any more; what happens to it, and what
   consumers must do with their goroutines, is specified in §7.
+- **Everything is reached through `ctx`, so `ctx` must be passed.** `slog.Logger.Info`
+  without `Context` hands `context.Background()` to the handler, and that line carries
+  no Lambda keys, no correlation ID and no `AppendKeys` attrs, and is never buffered.
+  Docs and examples use the `...Context` methods, `LogAttrs` or the package functions
+  (`logger.Info(ctx, …)`), and the same holds for metrics and tracer helpers (02 §14).
 - **Without the wrapper** (`FromContext` returns nil) every utility degrades: the logger
   omits Lambda keys, and `logger.FromContext` returns `slog.Default()` (also when
   `State.Logger` is nil); `metrics.FromContext` returns a nil `*Batch` whose methods are
@@ -491,11 +538,12 @@ Design notes:
   `ctx` and run `fn` untraced otherwise. This keeps unit tests of handler code free of
   ceremony.
 
-> **Changed after implementation** (decision 31). The original plan said
-> "`tracer.FromContext` returns a nil `*Segment` whose methods are no-ops". That is
-> false for the X-Ray SDK, and it would have turned every untraced invocation into a
-> panic. The nil-safe helpers above are the fix; the wrapper itself nil-checks the
-> segment before every SDK call.
+Pitfall (decision 31): do not assume a nil `*xray.Segment` behaves as a no-op. It does
+not, and an API that hands it to handler code would turn every untraced invocation into
+a panic. The nil-safe helpers are the answer for consumers; inside the library, the
+tracer nil-checks the segment before every SDK call. Acceptance: every exported tracer
+function and method is called in a test with no segment in `ctx` and with a nil
+`*Tracer`, and none panics.
 
 Illustrative handler code that is safe with and without the wrapper:
 
@@ -588,10 +636,11 @@ value afterwards has no effect on a wrapper already built, and one Options value
 configure several wrappers. With every utility nil, the wrapped handler behaves exactly
 like the unwrapped one plus the per-invocation state in its context.
 
-> **Changed after implementation.** `ResetKeys` was removed: `State` is per invocation,
-> so clearing it at the end was a no-op (decision 33). `RaiseOnEmptyMetrics` moved to
-> `metrics.Options`, because `Flush` is what reads it and consumers who flush without
-> the wrapper need it too (decision 32). `LogEvent` became a `*bool` (decision 42).
+Two Powertools options are deliberately absent from `powertools.Options`. There is no
+`ResetKeys`: `State` is per invocation, so clearing the keys at the end of an
+invocation would change nothing (decision 33; `logger.ResetKeys(ctx)` still exists for
+handler code). `RaiseOnEmptyMetrics` lives in `metrics.Options`, because `Flush` is what
+reads it and consumers who flush without the wrapper need it too (decision 32).
 
 `Wrap` is the recommended form: no reflection, no re-encoding, generic type inference
 gives the caller `lambda.Start(powertools.Wrap(handle, opts))`. The other handler shapes
@@ -675,12 +724,24 @@ Python's `## lambda_handler`. Under `WrapHandler` the derived name is the dynami
 (guarded, so `WrapHandler(nil, …)` does not panic at wrap time; the nil handler panics at
 invocation like any handler panic). `_HANDLER` is not used because on `provided.al2023`
 it is the executable name. `Options.HandlerName` replaces the derived name; the `"## "`
-prefix is always added.
+prefix is always added. The `WrapHandler` rule uses the type because `runtime.FuncForPC`
+has no function to look at for an interface value.
 
-> **Changed after implementation** (decisions 29, 31, 35). The original `begin`/`end`
-> took raw and typed events plus the response; they now take only what they need, and
-> the segment never crosses the root package boundary. The `WrapHandler` name rule did
-> not exist: `runtime.FuncForPC` has no function to look at for an interface value.
+Derived names a consumer should expect, and when to set `HandlerName`:
+
+| Handler passed to `Wrap` | Derived name | Advice |
+| --- | --- | --- |
+| a top-level function `handle` | `main.handle` | none |
+| a closure written in `main` | `main.main.func1` | set `HandlerName` |
+| a method value `a.handle` | `main.(*app).handle-fm` | set `HandlerName`, for example `"main.handle"` |
+| a nil function | `""` (`runtime.FuncForPC(0)` returns a nil `*Func`, whose `Name` is `""`) | the nil handler panics at invocation, re-raised like any panic |
+
+Dashboards and integration tests key on the segment name, so a function whose handler
+is a closure or a method sets `HandlerName` once, in the Options it shares with its
+tests.
+
+`begin` and `end` take only what they need (decisions 29, 31, 35), and the segment never
+crosses the root package boundary.
 
 ### 4.3 Sequence per invocation
 
@@ -738,7 +799,7 @@ Wrapper diagnostics are fixed strings, written through `logger.FromContext(ctx)`
 | WARN | `invalid CorrelationIDPath, correlation ID extraction disabled` | `path`, `error` (once, at wrap time) |
 | ERROR | `handler panicked` | `panic`, `stack` |
 
-**Edge cases the implementation had to decide.**
+**Edge cases, decided.** Each one has a test in the root package.
 
 - A malformed `CorrelationIDPath` is reported once at `WARN` when the wrapper is built
   and disables the extraction; it never fails an invocation.
@@ -801,20 +862,33 @@ before the stdout writes; the log buffer is flushed before metrics so an error's
 diagnostic lines precede the EMF line; metrics flush last so a `ColdStart` blob and the
 batch appear in a stable order.
 
-> **Changed after implementation** (decisions 30 to 35). The original sequence opened
-> the segment first "so that `xray_trace_id` is available"; that coupled logging to
-> sampling and stretched the segment over the wrapper's own work. With the trace ID
-> taken from the parsed header, the segment moved to just before the call. The batch is
-> created before `NewContext`, so `State` is never mutated after it is published. The
-> open-subsegment counter became a check of the SDK's own `Emitted` flag, and the
-> `Flush` error rule was made explicit for every error, not only `ErrEmptyMetrics`.
->
-> **Measured in implementation.** Wrapper overhead with all three utilities configured
-> but writing nowhere (no I/O, outside Lambda) was 3 to 4 allocations per invocation
-> (the budget was 12); with every utility nil, 2. `PprofLabels` added 3 allocations and
-> `DeadlineMargin` 2. `WrapHandler` cost about 12 allocations. On a laptop-class arm64 CPU, `Wrap` with all three utilities took about
-> 0.2 µs per invocation; allocation counts are machine-independent, times are not
-> (05 §3).
+Ordering pitfalls this sequence avoids (decisions 30 to 35):
+
+- **Do not open the segment first to obtain the trace ID.** That couples logging to
+  sampling (an unsampled invocation would log no `xray_trace_id`) and stretches the
+  segment over the wrapper's own work. The trace ID comes from the parsed header.
+- **Do not mutate `State` after `NewContext`.** The batch, the sampling decision and
+  every other immutable field are computed first, so no goroutine can observe a
+  half-built `State` and the immutable fields need no lock.
+- **Do not count open subsegments yourself.** Read the SDK's own `Emitted` flag (D7).
+- **Apply the `Flush` error rule to every `Flush` error**, not only to
+  `ErrEmptyMetrics`: the handler's own error or panic always wins.
+
+**Overhead budgets** (05 §3). Budget tests run outside Lambda with every utility writing to
+`io.Discard`, so the numbers are the wrapper's own work:
+
+| Configuration | Allocation budget per invocation | Expected with this design |
+| --- | --- | --- |
+| `Wrap`, logger, metrics and tracer configured, no I/O | ≤ 12 | 3 or 4 |
+| `Options.PprofLabels`, extra | ≤ 3 | 3 |
+| `Options.DeadlineMargin`, extra (arm and stop) | ≤ 2 | 2 (the timer and its callback) |
+| `Wrap`, every utility nil | not gated separately | about 2 (`State`, one `WithValue`) |
+| `WrapHandler`, all three utilities | not gated separately | about 12 (raw payload and response handling) |
+
+The latency target for `Wrap` with all three utilities is under 20 µs per invocation,
+`end()` included; expect a correct implementation to need well under one microsecond.
+Allocation counts do not depend on the machine and are gated exactly; times do, so they
+are tracked by the A/B benchmark gate rather than by an absolute threshold (05 §6).
 
 ### 4.4 Outbound propagation
 
@@ -846,11 +920,12 @@ func main() {
 req.Header.Set("X-Amzn-Trace-Id", tracer.Header(ctx)) // "" when there is no trace header
 ```
 
-> **Changed after implementation** (decisions 22, 30, 31). `tracer.InstrumentAWS`
-> mirrors `tracer.HTTPClient` so that the Powertools switches reach the AWS SDK as well;
-> calling `xray.Client` or `awsv2` directly is still possible but only
-> `AWS_XRAY_SDK_DISABLED` stops them. `Header` forwards `Rest`, which the SDK's own
-> clients drop.
+Why the helpers exist (decisions 22, 30, 31): `tracer.InstrumentAWS` mirrors
+`tracer.HTTPClient` so that the Powertools switches reach the AWS SDK as well. Calling
+`xray.Client` or `awsv2` directly is still possible, but only `AWS_XRAY_SDK_DISABLED`
+stops them, so the examples and docs always use the helpers. `Header` forwards `Rest`,
+which the SDK's own clients drop. Pitfall: `InstrumentAWS` must run before the service
+clients are built, because each client copies `APIOptions` when it is created.
 
 ## 5. Concurrency model
 
@@ -914,16 +989,28 @@ zero value needs no init; root tests reset it through an `export_test.go` hook),
 `syncwriter.Stdout` (the shared stdout writer), and `sync.Pool`s. There is no env
 snapshot (§3) and no default instance of any utility (decision 7).
 
-> **Changed after implementation** (decisions 33, 35). The env snapshot left this list;
-> `syncwriter.Stdout` joined it. Without one shared default writer, a logger and a
-> metrics instance would each own a mutex over the same `os.Stdout`, and a log line
-> could interleave with an EMF blob under multi-concurrency.
->
-> **Validated in implementation.** The concurrency claims were proved with `-race`
-> tests that run several invocations of one wrapped handler in parallel goroutines, each
-> with its own Lambda context and trace header, one test per utility plus one for
-> concurrent first invocations (exactly one cold start) and one for `WrapHandler`, and
-> check that each invocation's lines, blobs and segments stay its own.
+Why `syncwriter.Stdout` is on the list (decisions 33, 35): without one shared default
+writer, a logger and a metrics instance would each own a mutex over the same
+`os.Stdout`, and a log line could interleave with an EMF blob under multi-concurrency.
+Any new package-level variable must be added to this list with its reason, in the same
+change.
+
+**Acceptance tests for the concurrency model.** All run under `-race`:
+
+- Several invocations of one wrapped handler run in parallel goroutines, each with its
+  own Lambda context (request ID) and trace header, and each adds keys, metrics and
+  subsegments. One test per utility checks that every log line, EMF blob and segment
+  belongs to exactly one invocation: no line carries another invocation's request ID,
+  no blob holds another invocation's metric, no segment has another invocation's
+  parent.
+- N concurrent first invocations produce exactly one cold start (one `ColdStart`
+  annotation, one `ColdStart` metric, and only that invocation's log lines carry
+  `cold_start: true`).
+- The same parallel test for `WrapHandler`.
+- A handler that fans out goroutines adding to one `Batch` loses no value and emits each
+  metric once.
+- Every line written concurrently to the shared writer decodes as one JSON document:
+  no torn or interleaved lines.
 
 ## 6. Error and panic policy
 
@@ -968,8 +1055,8 @@ snapshot (§3) and no default instance of any utility (decision 7).
   A panic in the handler itself carries **no** labels: `pprof.Do` restores the parent
   labels in its own defer before the wrapper's deferred recover runs, and aws-lambda-go
   recovers every handler panic and reports it through the Runtime API without a Go
-  traceback. Cost: 3 allocations per invocation in the reference implementation; off by
-  default.
+  traceback, so the documentation must not promise labels there. Budget: at most 3
+  extra allocations per invocation (§4.3); off by default.
 - `Flush` on an empty batch is a warning, not an error, unless
   `metrics.Options.RaiseOnEmptyMetrics` is set (03 §7). `Flush` returns only sentinels
   (`ErrEmptyMetrics`, `ErrNamespaceMissing`), never an I/O error, and the wrapper returns
@@ -981,12 +1068,15 @@ snapshot (§3) and no default instance of any utility (decision 7).
   deliberate, documented difference from Python. `FlushSnapshot` on an empty batch writes
   nothing and warns nothing.
 
-> **Changed after implementation** (decisions 32, 35). The `Flush` error rule was
-> originally written for `ErrEmptyMetrics` only; it now covers every `Flush` error, and
-> `Flush` never surfaces I/O errors, so a full disk or a closed pipe cannot turn a
-> successful business result into a failed invocation. The `PprofLabels` text originally
-> promised labels in the handler's own panic traceback; reading `pprof.Do` and
-> aws-lambda-go showed that cannot happen, so the claim was narrowed.
+Why `Flush` never surfaces I/O errors (decisions 32, 35): a full disk or a closed pipe
+must not turn a successful business result into a failed invocation, and the consumer
+can do nothing about stdout from inside a handler. Only configuration errors (sentinels)
+reach the caller, and only when the handler itself succeeded.
+
+Acceptance for this section: a table test over {handler returns nil, returns an error,
+panics} × {`Flush` returns nil, `ErrEmptyMetrics`, `ErrNamespaceMissing`} checks the
+invocation result, the re-panic value and the `WARN` lines; a writer that always fails
+checks that no invocation fails because of it.
 
 ## 7. Deadlines, cancellation, freeze and shutdown
 
@@ -1018,27 +1108,39 @@ what consumers must do with their own goroutines.
 | D6 | **Opt-in pre-timeout flush** (`Options.DeadlineMargin`, default 0 = off). With a margin of, say, 100 ms, `begin()` arms `time.AfterFunc(remaining - margin, preTimeout)` when the context has a deadline and more than the margin remains; otherwise the timer is not armed, because a timer that fires at once would only race the handler. The timer lives in an unexported root-package struct local to `begin` and `end`, never in `State`. If the handler is still running when it fires, `preTimeout` writes a `WARN` line (`"invocation within <margin> of its deadline"` with `remaining_ms`), flushes the log buffer and flushes a **snapshot** of the metrics batch: `FlushSnapshot` writes the values recorded so far and then clears them, keeping dimensions, metadata and the open state, exactly like the 100-metric auto-flush (03 §3). The batch keeps accepting and `end()` flushes the rest. The trace is not touched: closing the handler segment early would misreport the invocation. `end()` stops the timer first. This is the only timer and the only goroutine the library can create; its lifetime ends at `end()`, except for a callback that has already started, which finishes on its own. Race with `end()`, defined: `preTimeout` first checks `State.Closed` and returns if set; `end()` calls `Stop()` and does not wait for a callback that already started, which is safe because every path the callback uses is mutex-protected and idempotent (`FlushSnapshot` on an empty or flushed batch writes nothing, a buffer flush writes under the buffer's mutex and on an empty buffer writes nothing, and the `WARN` goes through the same `syncwriter.Stdout`). The worst case is one extra `WARN` line and one extra EMF blob containing only metrics added between the snapshot and `Flush`, never a lost or duplicated metric value, because the snapshot clears what it wrote. Reason: after a timeout the runtime is reset (F4), so diagnostics that were not written before the deadline never reach CloudWatch. |
 | D7 | **Leaks become visible.** After closing the handler segment, the tracer's end-of-handler helper checks whether the SDK emitted it (`seg.RLock(); held := !seg.Emitted; seg.RUnlock()`). The SDK emits a closed segment only when none of its descendants is open, so `held` means a child opened by `tracer.Start`, `Capture`, `xray.Client`, `awsv2` or a direct SDK call is still open, and the wrapper logs one `WARN` ("handler trace held back by open subsegments"); such a child delays or loses the whole handler trace (7.5). |
 
-> **Changed after implementation** (decisions 24, 31, 33, 35, 44).
-> - **D5:** the plan did not say what `RemainingTime` returns without a deadline.
->   Returning 0 would make `context.WithTimeout(ctx, RemainingTime(ctx) - margin)`
->   expire at once in every unit test and local run; returning the maximum duration
->   keeps the same handler code working everywhere. The API review kept this choice.
-> - **D6:** the literal `AfterFunc(remaining - margin)` fires immediately when less than
->   the margin remains, so the timer is not armed then. `FlushSnapshot` was specified to
->   clear what it wrote, which is what makes the race with `end()` free of duplicates.
-> - **D7:** the plan's `State.OpenSegments` counter could only see children opened
->   through `tracer`, not `xray.Client`, `awsv2` or direct SDK calls. The SDK's own
->   `Emitted` flag sees all of them and needs no bookkeeping.
->
-> **Testing techniques that proved necessary.** The leak test combines three checks,
-> because none is sufficient alone: the Go 1.27 `goroutineleak` profile (count 0 and no
-> stack mentioning the module), which finds goroutines blocked forever; a scan of the
-> full goroutine profile for frames of this module; and a `testing/synctest` test that
-> proves a stopped margin timer never fires. A pending `time.AfterFunc` is not a
-> goroutine, so the profiles alone cannot show it. `synctest` also made every
-> deadline test deterministic: fake time advances only when every goroutine in the
-> bubble is blocked, so "fires at deadline minus margin" is asserted exactly, without
-> sleeps.
+Reasons behind three of the rules (decisions 24, 31, 33, 35, 44):
+
+- **D5:** returning 0 without a deadline would make
+  `context.WithTimeout(ctx, RemainingTime(ctx) - margin)` expire at once in every unit
+  test and local run; returning the maximum duration keeps the same handler code working
+  everywhere. Subtracting a margin from it cannot overflow.
+- **D6:** the literal `AfterFunc(remaining - margin)` fires immediately when less than
+  the margin remains, which is why the timer is not armed then. `FlushSnapshot` clears
+  what it wrote, which is what makes the race with `end()` free of duplicates.
+- **D7:** a counter kept by the library could only see children opened through
+  `tracer`, not those of `xray.Client`, `awsv2` or direct SDK calls. The SDK's own
+  `Emitted` flag sees all of them and needs no bookkeeping.
+
+**Acceptance tests for this section.**
+
+- **No leaked goroutine or timer.** The leak test combines three checks, because none is
+  sufficient alone: the Go 1.27 `goroutineleak` profile (count 0 and no stack mentioning
+  the module), which finds goroutines blocked forever; a scan of the full goroutine
+  profile for frames of this module, which finds goroutines that are still running; and
+  a `testing/synctest` test that proves a stopped margin timer never fires. A pending
+  `time.AfterFunc` is not a goroutine, so the profiles alone cannot show it.
+- **Deterministic deadlines.** Every deadline test runs inside a `synctest` bubble: fake
+  time advances only when every goroutine in the bubble is blocked, so "fires at
+  deadline minus margin", "not armed when less than the margin remains" and "stopped
+  timer never fires" are asserted exactly, without sleeps or flaky tolerances.
+- **The `preTimeout` race.** Under `synctest` and `-race`, `end()` and a firing callback
+  run in both orders; the output holds every metric value exactly once and at most one
+  extra `WARN` line.
+- **Cancelled context.** A handler that returns `ctx.Err()` after its context was
+  cancelled still produces the full end-of-invocation output (D1).
+- **Late calls.** A goroutine that outlives the handler logs, adds a metric and opens a
+  subsegment after `end()`; the results match 7.4, and the next invocation's output is
+  untouched.
 
 ### 7.3 Timeline of an invocation
 
@@ -1104,10 +1206,9 @@ does not cover the streaming phase. The wrapper returns the reader untouched and
 reads it; response capture skips it (04 §5). Response streaming stays unsupported in v1
 (decision 17).
 
-> **Changed after implementation** (decision 31). The late-call guard was narrowed to
-> what the tracer controls, and the SDK's re-emission behaviour was documented instead
-> of promised away. The streaming note was added: when `Out` is a reader the answer is
-> "late telemetry", and saying so is cheaper than supporting it in v1.
+Both limits are documented rather than engineered away (decision 31): the late-call
+guard covers what the tracer controls, and for a streamed body the answer is "late
+telemetry"; saying so is cheaper and more honest than half-supporting it in v1.
 
 ### 7.5 What consumers must do with their goroutines
 

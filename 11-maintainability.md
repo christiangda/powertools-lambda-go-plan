@@ -1,9 +1,10 @@
 # 11. Maintainability review
 
 A read of the whole plan with one question: what will cost the next maintainer time, and
-is that cost bought with something worth it. Each decision below is rated honestly. Three
-adjustments came out of this review and are applied in the other files (§3). §2.1 adds
-what the costs turned out to be in a reference implementation of the plan.
+is that cost bought with something worth it. Each decision below is rated honestly, with
+the mitigation that keeps its cost bounded. Three adjustments came out of this review and
+are applied in the other files (§3); §2.1 says where the maintenance effort is expected to
+go, so a team can plan for it.
 
 ## 1. What keeps the library maintainable
 
@@ -14,7 +15,7 @@ what the costs turned out to be in a reference implementation of the plan.
 | Standard library as the framework | `log/slog` is the logger API, `encoding/json/v2` the encoder, `testing` the test framework, `context` the carrier. Nothing to relearn, nothing to upgrade except Go itself. |
 | Behaviour pinned by tests that read like specifications | `slogtest` conformance, EMF schema validation, golden documents compared semantically (X-Ray documents read back from a per-test UDP listener), limits as table tests, concurrency under `-race`, allocation budgets in their own non-race step, a leak profile plus a `synctest` proof that the margin timer stops (06). |
 | Upstream parity made visible | The parity matrices in 02, 03 and 04 list what matches Powertools Python/TypeScript and what deliberately differs, so a future upstream change is a diff against a table, not archaeology. |
-| Decisions recorded with reasons | 09 is a decision log, including the decisions taken during implementation (26 onward). Phase 0 copies it to `docs/DECISIONS.md`; in Phase 6, before the release commit, the `.plan/` directory moves to `docs/design/` as history (07 Phase 6). |
+| Decisions recorded with reasons | 09 is a decision log of 45 numbered decisions, each with its reason and the files that apply it. Phase 0 copies it to `docs/DECISIONS.md`; in Phase 6, before the release commit, the `.plan/` directory moves to `docs/design/` as history (07 Phase 6). |
 | Tooling that is standard | `gofmt`, `go vet`, `go fix`, golangci-lint v2 (`staticcheck`, `forbidigo`, `depguard`, a complexity ratchet), `govulncheck`, a coverage-threshold tool, `go-licenses`, `betteralign`, `benchstat`, `apidiff`, `actionlint`, `zizmor`, semantic-release. No in-house analyzers (adjustment B below); the in-house parts are a few gate scripts with fixture self-tests (§2). |
 | Releases come from commits | semantic-release cuts the tag and the release notes from conventional commits on every push to `main`, counting from a seed tag `v0.0.0` (decisions 27 and 34). No changelog to keep in sync, no release script, nothing pushed to `main` by hand. |
 | One command per check | Every check is a `make` target, `make checks` runs everything CI runs, and CI calls the same targets, so a laptop and CI give the same verdict. |
@@ -23,7 +24,7 @@ what the costs turned out to be in a reference implementation of the plan.
 
 | Decision | Maintenance cost | Why it is worth it | How the cost is bounded |
 | --- | --- | --- | --- |
-| Custom `slog.Handler` instead of wrapping `slog.JSONHandler` (02 §5) | The largest single body of code to maintain: group handling, `ReplaceAttr` semantics, pre-rendered attrs, buffering. Roughly 800 lines plus tests. | It is the only way to get Powertools key order, invocation keys read from `ctx`, sampling and buffering without a second pass over every record, and the zero-allocation record path (05). | It follows `slog`'s own `commonHandler` structure (top-level attrs, grouped prefix, trailing groups opened only when a record attr renders, decision 33), so it reads like the standard handlers; `ReplaceAttr` sees only record and `With` attrs, so the per-invocation render caches stay handler-independent; all escaping and value encoding is `jsontext`, never hand-written; `slogtest.Run` catches contract regressions. |
+| Custom `slog.Handler` instead of wrapping `slog.JSONHandler` (02 §5) | The largest single body of code to maintain: group handling, `ReplaceAttr` semantics, pre-rendered attrs, buffering, and the tests that pin all of it. | It is the only way to get Powertools key order, invocation keys read from `ctx`, sampling and buffering without a second pass over every record, and the zero-allocation record path (05). | It follows `slog`'s own `commonHandler` structure (top-level attrs, grouped prefix, trailing groups opened only when a record attr renders, decision 33), so it reads like the standard handlers; `ReplaceAttr` sees only record and `With` attrs, so the per-invocation render caches stay handler-independent; all escaping and value encoding is `jsontext`, never hand-written; `slogtest.Run` catches contract regressions. |
 | One module, one version (01 §2, decision 25) | The X-Ray SDK and its dependency tree sit in every consumer's module graph, so logger-only users see `go.sum` entries and Dependabot alerts for code they never link. | One `go.mod`, one tag, no release script, no cross-module contract, nothing unusual for a newcomer; consumers see one toolkit version, as with Powertools Python. | The `deps` job fails when any production package except `tracer` imports the SDK, or when `logger`, `metrics` or `internal/...` reach it transitively; binaries without the tracer are unaffected; `govulncheck` reports reachable vulnerabilities only; splitting `tracer` into its own module at a major version remains possible. |
 | Shared `invocation.State` with exported fields and two `any` slots (01 §4.1) | A cross-package contract: renaming or removing a field touches three packages at once. The `any` slots are type-asserted by their owners. | One context lookup per utility and a single lifecycle. The alternative (one context key per utility) costs an extra lookup per log call and spreads the lifecycle over four places. | **Append-only rule**: within a major version, fields are only ever added (01 §4.1, 07 risks). The complete struct is written in Phase 1, so the utility phases fill it rather than reshape it. It holds only shared data: no handler segment (a local variable of the wrapper), no open-segment counter, no margin timer. A single module version makes mixed versions impossible. |
 | Wrapping the X-Ray SDK (04 §1) | Its dependency tree (grpc, protobuf, fasthttp) brings Dependabot churn and CVE noise, including vulnerable indirect versions that need an explicit floor in `go.mod` (06 §4.2); its global configuration and init-time behaviour are documented surprises. Its `*xray.Segment` methods are not nil-safe, and it streams by subsegment count, not bytes, so an oversized document is dropped whole. | AWS maintains it; the Lambda facade, emission, streaming, HTTP and SDK v2 instrumentation and SQL tracing come for free. | Imported only by the `tracer` package; nil-safe helpers (`AddAnnotation`, `AddMetadata`, `InstrumentAWS`) and nil checks in `end()`; a per-invocation metadata budget keeps documents emittable; `govulncheck` reports only reachable vulnerabilities; the wrapper never touches SDK globals; tests read the real documents from a per-test UDP listener, so SDK upgrades are checked end to end. |
@@ -35,7 +36,7 @@ what the costs turned out to be in a reference implementation of the plan.
 | Reading the trace header from the plain string context key `"x-amzn-trace-id"` (01 R2) | `aws-lambda-go` exports no constant for it; a rename there would silently disable tracing and `xray_trace_id`. | It is the only per-invocation source under multi-concurrency. | One constant in `internal/lambdaenv`; no environment fallback, so a missing value means "no trace" for logger and tracer alike (decision 30). Staticcheck flags string keys (SA1029), so tests set the key through one helper, the only place with the suppression. The optional real-AWS integration test exercises the real runtime path. |
 | Releases from conventional commits (decisions 27, 34, 40) | The version is only as good as the commit types: a `feat` mislabelled `fix` cuts the wrong version, an example-only `fix` cuts a library patch, and a body line that starts with the breaking-change phrase cuts a major. | No changelog or release script; every phase ships a version that can be tried; release notes come for free. | A commit-message hook and a CI check of the format; `chore(examples)` for example-only changes; the breaking-change guard on every pull request and before every release (06 §6.2). |
 | Build tag on test files (optional convention, 06 §1) | A tool run without the tag silently skips every test, and two kinds of files are exceptions (examples untagged, the real-AWS harness with its own tag). | `go build` never compiles test helpers; the convention may already be a house rule. | The tag set once in the Makefile defaults and in golangci-lint's `run.build-tags`; `doc-check` proves the untagged examples compile alone; a CI step proves the harness skips. Without such a house rule, the plan works the same untagged. |
-| In-house gate scripts | Four small shell scripts (import rules, bench gate over benchstat CSV, size gate, breaking-change guard), each with fixture-based self-tests, are code to maintain. | Each encodes a rule no standard tool checks: benchstat sets no exit code, the angular parser's blind spots, the per-binary size budget, transitive import rules. | Kept small (under 300 lines each in the reference implementation), run by `make` targets so CI and a laptop agree, and self-tested in `make checks`. |
+| In-house gate scripts | A handful of small shell scripts (import rules, bench gate over benchstat CSV, size gate, breaking-change guard, the check that the integration harness skips), each with fixture-based self-tests, are code to maintain. | Each encodes a rule no standard tool checks: benchstat sets no exit code, the angular parser's blind spots, the per-binary size budget, transitive import rules. | One rule per script, run by `make` targets so CI and a laptop agree, and self-tested against fixtures in `make checks`; the breaking-change guard is the largest and the one whose self-tests matter most, because a miss there cuts a wrong major version. |
 
 ```mermaid
 quadrantChart
@@ -60,19 +61,19 @@ quadrantChart
   Gate scripts: [0.45, 0.7]
 ```
 
-### 2.1 What the costs turned out to be
+### 2.1 Where the effort goes
 
-Figures from a reference implementation of this plan at `v1.0.0`, to calibrate the
-estimates above. They are one data point, not a target.
+What a team should expect when it builds and then maintains the library, and how the plan
+keeps each part cheap. These are planning expectations, not targets.
 
-| Cost | Planned | Observed |
+| Area | What to expect | How the plan keeps it cheap |
 | --- | --- | --- |
-| Custom `slog.Handler` | about 800 lines plus tests | the handler and its renderer are about 500 lines; the whole `logger` package, with configuration, buffering, context helpers and a long package doc, about 1,800 |
-| Library size | not estimated | about 7,800 lines of non-test Go across the root, the three utilities and `internal/`; about 26,000 lines of tests, roughly three lines of test per line of code, most of it table rows, golden documents and wrapper lifecycle cases |
-| Gate scripts | none planned (adjustment B dropped the in-house analyzer) | about 900 lines of shell across six scripts, a third of it the breaking-change guard and the self-test runner |
-| Decisions | 25 at the start | 44 at `v1.0.0`: about a third of the later ones came from a pre-implementation check of the plan against the SDK sources, the rest from implementation and the API review (09) |
-| API changes after the freeze | none expected | three exported changes, all from the API review (one option became `*bool`, one unusable type and its two constants were unexported), plus the expected "no longer comparable" `apidiff` lines once the stubs got real fields (08 §4) |
-| Binary size | `hello` (logger and metrics, no wrapper) under 1 MiB over a bare `aws-lambda-go` binary | 128 KiB over bare, with no X-Ray SDK linked; the full example with the wrapper, the tracer and the AWS SDK for Go v2 is about 10 MiB over bare, recorded, not gated |
+| Custom `slog.Handler` | The handler and its renderer are a compact core; most of the `logger` package is configuration, buffering, context helpers and a long package doc with examples. | `commonHandler` structure, `jsontext` for every byte of escaping, `slogtest.Run` for the contract (02 §5). |
+| Test code | Considerably more test code than library code, around three lines of test per line of code, most of it table rows, golden documents and wrapper lifecycle cases. | Table-driven tests, golden files under `testdata/`, one shared helper package (`internal/testsupport`), semantic comparison with `cmp.Diff` so formatting changes do not ripple through (06 §2). |
+| Gate scripts | The breaking-change guard and the self-test runner are the largest scripts; the import, size and bench gates stay small. | Fixture-based self-tests in `make checks`; each script encodes one rule (§2). |
+| Decision log | The log grows beyond the 45 decisions of 09 as the code meets cases the design does not foresee. | Every change lands in `docs/DECISIONS.md` in the pull request that needs it, with a reason (07 Delivery guidance, item 8). |
+| API changes after the freeze | Only the API review's own changes, plus the `apidiff` "no longer comparable" lines that appear when stubs get their real fields (08 §4). | Phase 1 freezes the exported API as documented stubs; the review runs during v0, so its changes are ordinary `feat` and `fix` commits. |
+| Binary size | Logger and metrics use a small fraction of the 1 MiB budget over a bare `aws-lambda-go` binary; the tracer with AWS SDK for Go v2 clients adds several MiB, recorded, not gated. | The blocking `size` job on `hello` and the `deps` rules keep the SDK out of binaries that do not trace (05 §6, 06 §5.1). |
 
 ## 3. Adjustments made by this review
 
